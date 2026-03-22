@@ -144,7 +144,7 @@ function iconScriptByName(name: string, sensorContextRaw = ""): string {
     return "CLS;D 71 35 8;D 89 35 8;L 63 39 80 58;L 97 39 80 58;F 72 33 16 8";
   if (n === "clock") return "CLS;C 80 40 24;L 80 40 80 27;L 80 40 91 45;D 80 40 2";
   if (n === "wifi")
-    return "CLS;C 80 52 3;L 62 44 80 52;L 98 44 80 52;L 50 34 80 52;L 110 34 80 52;L 42 24 80 52;L 118 24 80 52";
+    return "CLS;D 80 54 3;L 72 46 80 42;L 80 42 88 46;L 64 40 72 34;L 72 34 88 34;L 88 34 96 40;L 56 32 66 24;L 66 24 94 24;L 94 24 104 32";
   if (n === "temp" || n === "temperature") return "CLS;R 72 20 16 28;D 80 53 7;F 77 30 6 20";
   if (n === "home" || n === "house")
     return "CLS;L 54 38 80 20;L 80 20 106 38;R 58 38 44 26;R 74 46 12 18";

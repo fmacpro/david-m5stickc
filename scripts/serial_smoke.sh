@@ -15,6 +15,18 @@ PROMPTS=(
   "David, what date is it today?"
   "David, what is your internal temperature?"
   "David, in star trek voyager, who is the captain of the ship?"
+  "David, tell me a short joke."
+  "David, what is 12 times 7?"
+  "David, what is the capital of Japan?"
+  "David, what year is it?"
+  "David, who made you?"
+  "David, can you draw a heart?"
+  "David, can you draw a square?"
+  "David, can you draw a triangle?"
+  "David, can you draw a star?"
+  "David, can you draw a smiley face?"
+  "David, can you draw a battery icon?"
+  "David, can you draw a wifi icon?"
 )
 
 cleanup() {
