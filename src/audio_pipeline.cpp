@@ -88,18 +88,20 @@ void processMicPcmInPlace(int16_t* pcm, size_t n, int& avg_abs_out, int& peak_ou
   const int dc = static_cast<int>(sum / static_cast<int64_t>(n));
   const int avg_abs = static_cast<int>(sum_abs / static_cast<int64_t>(n));
 
-  const int gate = constrain(avg_abs / 3, 120, 1200);
-  const int half_gate = gate / 2;
+  // Keep mic cleanup gentle for STT: aggressive gates can erase quieter
+  // consonants/syllables in the middle of phrases.
+  const int gate = constrain(avg_abs / 8, 40, 280);
+  const int fade_start = gate / 2;
 
   int64_t out_sum_abs = 0;
   int out_peak = 0;
   for (size_t i = 0; i < n; ++i) {
     int v = static_cast<int>(pcm[i]) - dc;
     int a = (v < 0) ? -v : v;
-    if (a < half_gate) {
-      v = 0;
+    if (a < fade_start) {
+      v = (v * 3) / 4;
     } else if (a < gate) {
-      const int scaled = (a - half_gate) * 2;
+      const int scaled = (a * 85) / 100;
       v = (v < 0) ? -scaled : scaled;
     }
     pcm[i] = clampI16(v);
@@ -138,49 +140,8 @@ void processPlaybackWavInPlace(uint8_t* wav, size_t wav_len) {
   if (!wav || wav_len < 44) return;
   if (memcmp(wav + 0, "RIFF", 4) != 0 || memcmp(wav + 8, "WAVE", 4) != 0) return;
   if (memcmp(wav + 12, "fmt ", 4) != 0 || memcmp(wav + 36, "data", 4) != 0) return;
-
-  const uint16_t channels = readLE16(wav + 22);
-  const uint16_t bits = readLE16(wav + 34);
-  const size_t data_len = static_cast<size_t>(readLE32(wav + 40));
-  if (channels != 1) return;
-  if (data_len > (wav_len - 44)) return;
-
-  if (bits == 8) {
-    // Keep 8-bit TTS audio untouched. Extra gating/compression here can
-    // over-attenuate already-compressed speech and make output nearly silent.
-    return;
-  } else if (bits == 16) {
-    if ((data_len & 1u) != 0) return;
-    uint8_t* d = wav + 44;
-    const size_t n = data_len / 2u;
-    if (n == 0) return;
-    int64_t sum_abs = 0;
-    int peak = 0;
-    for (size_t i = 0; i < n; ++i) {
-      const int s = static_cast<int>(readI16LE(d + i * 2u));
-      const int a = (s < 0) ? -s : s;
-      sum_abs += a;
-      if (a > peak) peak = a;
-    }
-    const int avg_abs = static_cast<int>(sum_abs / static_cast<int64_t>(n));
-    float gain = 1.0f;
-    if (peak > 0) {
-      const float target_peak = 24000.0f;
-      gain = target_peak / static_cast<float>(peak);
-    }
-    if (avg_abs < 2600) gain *= 1.05f;
-    if (gain < 0.9f) gain = 0.9f;
-    if (gain > 1.25f) gain = 1.25f;
-    for (size_t i = 0; i < n; ++i) {
-      const int16_t s = readI16LE(d + i * 2u);
-      float x = static_cast<float>(s) / 32768.0f;
-      x *= gain;
-      x = softCompressor(x);
-      if (x < kPlaybackNoiseGateNorm && x > -kPlaybackNoiseGateNorm) x = 0.0f;
-      const int16_t out = clampI16(static_cast<int32_t>(x * 32767.0f));
-      writeLE16(d + i * 2u, static_cast<uint16_t>(out));
-    }
-  }
+  // Keep cloud TTS audio untouched. On-device compression/gating can introduce
+  // audible distortion on the tiny M5 speaker path.
 }
 
 uint8_t estimateSpeakingLevel(const uint8_t* wav, size_t wav_len, unsigned long elapsed_ms) {

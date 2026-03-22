@@ -41,7 +41,7 @@ export async function repairTranscript(
     "You repair noisy speech-to-text transcripts for a small voice assistant.",
     "Return ONLY the corrected user transcript text.",
     "Do not answer the question.",
-    "Preserve intent and wording as spoken.",
+    "Preserve intent and wording as spoken. Keep all key words; do not shorten.",
     "Correct likely recognition mistakes for names/numbers/commands.",
     "Keep it concise and natural.",
     `Transcript: ${original}`,
@@ -81,10 +81,79 @@ export async function repairTranscript(
     const fixed = extractOutputText(parsed).trim();
     if (!fixed) return original;
     if (fixed.length > 260) return original;
+    if (!isSafeRepair(original, fixed)) return original;
     return fixed;
   } catch {
     return original;
   }
+}
+
+function isSafeRepair(original: string, candidate: string): boolean {
+  const o = normalizeForCompare(original);
+  const c = normalizeForCompare(candidate);
+  if (!o || !c) return false;
+  if (o === c) return true;
+
+  // Reject heavy rewrites that could drop key question details.
+  const lenRatio = c.length / o.length;
+  if (lenRatio < 0.75 || lenRatio > 1.8) return false;
+
+  const oTokens = tokenSet(o);
+  const cTokens = tokenSet(c);
+  if (oTokens.size === 0 || cTokens.size === 0) return false;
+
+  let common = 0;
+  for (const t of oTokens) {
+    if (cTokens.has(t)) common += 1;
+  }
+  const overlapOriginal = common / oTokens.size;
+  if (overlapOriginal < 0.6) return false;
+
+  // Preserve intent-bearing words; if repair drops any, keep original.
+  const critical = [
+    "time",
+    "clock",
+    "date",
+    "day",
+    "year",
+    "battery",
+    "charge",
+    "level",
+    "temp",
+    "temperature",
+    "wifi",
+    "signal",
+    "draw",
+    "shape",
+    "icon",
+    "who",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+  ];
+  for (const k of critical) {
+    if (oTokens.has(k) && !cTokens.has(k)) return false;
+    if (!oTokens.has(k) && cTokens.has(k)) return false;
+  }
+  return true;
+}
+
+function normalizeForCompare(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenSet(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of text.split(" ")) {
+    if (tok.length >= 2) out.add(tok);
+  }
+  return out;
 }
 
 export async function generateReply(

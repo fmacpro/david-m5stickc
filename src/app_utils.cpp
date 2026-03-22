@@ -40,6 +40,28 @@ String jsonEscape(const String& in) {
   return out;
 }
 
+String urlEncode(const String& in) {
+  static const char* hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(in.length() * 3);
+  for (size_t i = 0; i < in.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(in[i]);
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else if (c == ' ') {
+      out += '+';
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
 String urlDecode(const String& in) {
   String out;
   out.reserve(in.length());

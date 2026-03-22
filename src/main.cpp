@@ -5,6 +5,7 @@
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <ctype.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
@@ -27,13 +28,15 @@ static constexpr size_t kRecordMsMin = 550;
 static constexpr size_t kRecordMsMax = 3200;
 static constexpr size_t kRecordSamplesMin = (kSampleRate * kRecordMsMin) / 1000;
 static constexpr size_t kRecordSamplesMax = (kSampleRate * kRecordMsMax) / 1000;
-static constexpr size_t kSttChunkMs = 1400;
+static constexpr size_t kSttChunkMs = 1800;
 static constexpr size_t kSttChunkSamples = (kSampleRate * kSttChunkMs) / 1000;
 static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
+static constexpr size_t kMinTurnCaptureMs = 3200;
+static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
 static constexpr int kSttChunkMaxCount = 16; // ~32s max hold-to-talk capture
 static constexpr size_t kRecordChunk = 512;
-static constexpr size_t kMicWarmupMs = 120;
-static constexpr size_t kReleaseTailMs = 300;
+static constexpr size_t kMicWarmupMs = 60;
+static constexpr size_t kReleaseTailMs = 800;
 // Mic front-end tuning for better STT clarity on natural speech/accents.
 static constexpr int kMicMagnification = 30;
 static constexpr int kMicNoiseFilterLevel = 1;
@@ -211,15 +214,26 @@ static void mergeTranscriptPart(String& transcript, const String& part_in) {
     return;
   }
 
-  // Avoid appending obvious repeats.
+  // Avoid appending only exact duplicate tails; keep conservative to prevent
+  // dropping valid continuation text on long questions.
   if (transcript.endsWith(part)) return;
-  if (part.length() >= 14 && transcript.indexOf(part) >= 0) return;
 
   int overlap = 0;
   const int max_check = (transcript.length() < part.length()) ? transcript.length() : part.length();
-  const int cap = (max_check > 48) ? 48 : max_check;
-  for (int n = cap; n >= 6; --n) {
-    if (transcript.substring(transcript.length() - n) == part.substring(0, n)) {
+  const int cap = (max_check > 36) ? 36 : max_check;
+  for (int n = cap; n >= 14; --n) {
+    const String tail = transcript.substring(transcript.length() - n);
+    const String head = part.substring(0, n);
+    if (tail == head) {
+      // Prefer overlaps that end/start on word boundaries to avoid accidental
+      // matches such as "ing th" across different words.
+      const bool left_word_ok =
+          (transcript.length() == static_cast<size_t>(n)) ||
+          isspace(static_cast<unsigned char>(transcript[transcript.length() - n - 1]));
+      const bool right_word_ok =
+          (part.length() == static_cast<size_t>(n)) ||
+          isspace(static_cast<unsigned char>(part[n]));
+      if (!left_word_ok && !right_word_ok) continue;
       overlap = n;
       break;
     }
@@ -1032,6 +1046,8 @@ static bool captureTranscriptChunked(String& transcript, String& err) {
     uint64_t sum_abs = 0;
     int peak = 0;
     const unsigned long chunk_start = millis();
+    bool release_started = false;
+    unsigned long release_start_ms = 0;
 
     while (offset < kSttChunkSamples) {
       const size_t chunk =
@@ -1050,9 +1066,18 @@ static bool captureTranscriptChunked(String& transcript, String& err) {
         err = "Cancelled";
         return false;
       }
-      if (!M5.BtnA.isPressed() && offset >= kSttChunkMinSamples) {
-        still_holding = false;
-        break;
+      const bool a_pressed = M5.BtnA.isPressed();
+      if (!a_pressed && offset >= kSttChunkMinSamples) {
+        if (!release_started) {
+          release_started = true;
+          release_start_ms = millis();
+        } else if (millis() - release_start_ms >= kReleaseTailMs &&
+                   (total_samples + offset) >= kMinTurnCaptureSamples) {
+          still_holding = false;
+          break;
+        }
+      } else if (a_pressed) {
+        release_started = false;
       }
       if (millis() - chunk_start > 3000) break;
     }
@@ -1189,7 +1214,15 @@ static bool captureTranscriptChunked(String& transcript, String& err) {
     while (consumed < block_samples) {
       size_t request_samples = block_samples - consumed;
       String part;
-      String stt_prompt = "Transcribe British English speech exactly, including names and numbers.";
+      String stt_prompt = "Continue transcript exactly. ";
+      if (transcript.length() > 0) {
+        String tail = transcript;
+        if (tail.length() > 80) tail = tail.substring(tail.length() - 80);
+        stt_prompt += "Previous context: ";
+        stt_prompt += tail;
+      } else {
+        stt_prompt += "Start of utterance.";
+      }
       String stt_err;
       size_t used_samples = 0;
       bool ok_seg = false;
@@ -1495,7 +1528,7 @@ static bool speakReplyInChunks(const String& text, String& err) {
     return false;
   }
 
-  const int max_chunk_chars = 64;
+  const int max_chunk_chars = 140;
   const int min_break_chars = 20;
   int chunk_count = 0;
   const int max_chunks = 10;
@@ -1663,77 +1696,116 @@ static bool requestVoiceTurnText(
   const String nonce = nonceHex();
   const String canonical = ts + "." + nonce + ".POST." + path + "." + body_hash;
   const String signature = hmacSha256Hex(DEVICE_SHARED_SECRET, canonical);
+  String last_err = "";
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, String(API_BASE_URL) + path)) {
+      last_err = "http begin failed";
+      continue;
+    }
+    http.setTimeout(30000);
+    const char* header_keys[] = {"Content-Type", "x-transcript", "x-transcript-original", "x-reply", "x-screen"};
+    http.collectHeaders(header_keys, 5);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-timestamp", ts);
+    http.addHeader("x-nonce", nonce);
+    http.addHeader("x-signature", signature);
+    // Prefer single cloud-generated audio to reduce on-device chunk orchestration and
+    // improve reliability on constrained memory devices.
+    http.addHeader("x-tts-chunked", "0");
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, String(API_BASE_URL) + path)) {
-    err = "http begin failed";
-    return false;
-  }
-  const char* header_keys[] = {"Content-Type", "x-transcript", "x-reply", "x-screen"};
-  http.collectHeaders(header_keys, 4);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-device-id", DEVICE_ID);
-  http.addHeader("x-timestamp", ts);
-  http.addHeader("x-nonce", nonce);
-  http.addHeader("x-signature", signature);
-  http.addHeader("x-tts-chunked", "1");
+    const int code = http.POST(body, body_str.length());
+    logLine(String("[HTTP] /v1/voice-turn-text -> ") + String(code));
+    if (code < 0) {
+      last_err = "TURN_TEXT HTTP " + String(code);
+      http.end();
+      if (attempt == 0) {
+        logLine("[TURN TEXT] transient transport error, retrying once...");
+        delay(120);
+        continue;
+      }
+      err = last_err;
+      return false;
+    }
+    if (code != 200 && code != 204) {
+      const String payload = http.getString();
+      logLine(String("[TURN TEXT ERROR] ") + payload);
+      http.end();
+      err = "TURN_TEXT HTTP " + String(code) + " " + truncateForScreen(payload, 60);
+      return false;
+    }
 
-  const int code = http.POST(body, body_str.length());
-  logLine(String("[HTTP] /v1/voice-turn-text -> ") + String(code));
-  if (code != 200 && code != 204) {
-    const String payload = http.getString();
-    logLine(String("[TURN TEXT ERROR] ") + payload);
+    transcript = urlDecode(http.header("x-transcript"));
+    const String transcript_original = urlDecode(http.header("x-transcript-original"));
+    reply = urlDecode(http.header("x-reply"));
+    screen_action = http.header("x-screen");
+    if (transcript_original.length() > 0 && transcript_original != transcript) {
+      logLine(String("[STT ORIG] ") + transcript_original);
+      logLine(String("[STT FIXD] ") + transcript);
+    }
+
+    if (code == 204) {
+      http.end();
+      wav_out = nullptr;
+      wav_len = 0;
+      return true;
+    }
+
+    const String resp_type = http.header("Content-Type");
+    if (resp_type.indexOf("audio/wav") < 0) {
+      const String payload = http.getString();
+      http.end();
+      err = "Unexpected type: " + resp_type + " " + truncateForScreen(payload, 40);
+      return false;
+    }
+
+    const int len = http.getSize();
+    if (len <= 0 || len > 140000) {
+      http.end();
+      err = "Turn audio too large";
+      return false;
+    }
+
+    // Release STT buffers before playback allocation to reduce heap fragmentation.
+    if (g_pcm) {
+      free(g_pcm);
+      g_pcm = nullptr;
+    }
+    if (g_stt_multipart_buf) {
+      free(g_stt_multipart_buf);
+      g_stt_multipart_buf = nullptr;
+      g_stt_multipart_buf_cap = 0;
+    }
+
+    wav_out = static_cast<uint8_t*>(malloc(len));
+    if (!wav_out) {
+      logLine(String("[TURN AUDIO] malloc fallback len=") + String(len) +
+              " free=" + String(ESP.getFreeHeap()) +
+              " max=" + String(ESP.getMaxAllocHeap()));
+      http.end();
+      wav_out = nullptr;
+      wav_len = 0;
+      return true;
+    }
+    WiFiClient* stream = http.getStreamPtr();
+    size_t got = 0;
+    const bool full = readFully(*stream, wav_out, static_cast<size_t>(len), 4000, got);
     http.end();
-    err = "TURN_TEXT HTTP " + String(code) + " " + truncateForScreen(payload, 60);
-    return false;
-  }
-
-  transcript = urlDecode(http.header("x-transcript"));
-  reply = urlDecode(http.header("x-reply"));
-  screen_action = http.header("x-screen");
-
-  if (code == 204) {
-    http.end();
-    wav_out = nullptr;
-    wav_len = 0;
+    wav_len = got;
+    if (!full || wav_len < 44) {
+      free(wav_out);
+      wav_out = nullptr;
+      logLine(String("[TURN AUDIO] stream fallback got=") + String(got) + "/" + String(len));
+      wav_len = 0;
+      return true;
+    }
     return true;
   }
-
-  const String resp_type = http.header("Content-Type");
-  if (resp_type.indexOf("audio/wav") < 0) {
-    const String payload = http.getString();
-    http.end();
-    err = "Unexpected type: " + resp_type + " " + truncateForScreen(payload, 40);
-    return false;
-  }
-
-  const int len = http.getSize();
-  if (len <= 0 || len > 140000) {
-    http.end();
-    err = "Turn audio too large";
-    return false;
-  }
-
-  wav_out = static_cast<uint8_t*>(malloc(len));
-  if (!wav_out) {
-    http.end();
-    err = String("OOM turn audio free=") + String(ESP.getFreeHeap()) + " max=" + String(ESP.getMaxAllocHeap());
-    return false;
-  }
-  WiFiClient* stream = http.getStreamPtr();
-  size_t got = 0;
-  const bool full = readFully(*stream, wav_out, static_cast<size_t>(len), 4000, got);
-  http.end();
-  wav_len = got;
-  if (!full || wav_len < 44) {
-    free(wav_out);
-    wav_out = nullptr;
-    err = String("Turn audio incomplete: ") + String(got) + "/" + String(len);
-    return false;
-  }
-  return true;
+  err = last_err.length() ? last_err : "TURN_TEXT failed";
+  return false;
 }
 
 static void setUiRaw(int state, const String& status, const String& detail) {

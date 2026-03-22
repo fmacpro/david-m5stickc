@@ -85,9 +85,17 @@ async function completeVoiceTurn(
   sensorContext: string,
   chunkedTts: boolean
 ): Promise<Response> {
-  const cleanedOriginalTranscript = stripSttPromptLeak(transcript);
-  const repairedTranscriptRaw = await repairTranscript(env, cleanedOriginalTranscript, sensorContext);
-  const repairedTranscript = stripSttPromptLeak(repairedTranscriptRaw);
+  const cleanedOriginalTranscript = sanitizeTranscriptIntentNoise(
+    stripSttPromptLeak(transcript)
+  );
+  const repairedTranscriptRaw = await repairTranscript(
+    env,
+    cleanedOriginalTranscript,
+    sensorContext
+  );
+  const repairedTranscript = sanitizeTranscriptIntentNoise(
+    stripSttPromptLeak(repairedTranscriptRaw)
+  );
 
   const originalLower = cleanedOriginalTranscript.toLowerCase();
   const repairedLower = repairedTranscript.toLowerCase();
@@ -216,6 +224,10 @@ async function completeVoiceTurn(
     const headers = new Headers();
     headers.set("Cache-Control", "no-store");
     headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
+    headers.set(
+      "x-transcript-original",
+      encodeHeaderValue(cleanedOriginalTranscript, 1200)
+    );
     headers.set("x-reply", encodeHeaderValue(finalReply, 1200));
     headers.set(
       "x-screen",
@@ -268,6 +280,10 @@ async function completeVoiceTurn(
   headers.set("Content-Type", ttsResp.headers.get("content-type") || "audio/wav");
   headers.set("Cache-Control", "no-store");
   headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
+  headers.set(
+    "x-transcript-original",
+    encodeHeaderValue(cleanedOriginalTranscript, 1200)
+  );
   headers.set("x-reply", encodeHeaderValue(finalReply));
   headers.set(
     "x-screen",
@@ -337,4 +353,33 @@ function extractCharging(sensorContextRaw: string): boolean {
   } catch {
     return false;
   }
+}
+
+function sanitizeTranscriptIntentNoise(input: string): string {
+  const text = input.replace(/\s+/g, " ").trim();
+  if (!text) return text;
+  const q = text.indexOf("?");
+  if (q < 20 || q >= text.length - 8) return text;
+
+  const tail = text.slice(q + 1).toLowerCase();
+  const hasImperative = /\b(display|show|draw)\b/.test(tail);
+  if (!hasImperative) return text;
+
+  const keyHints = [
+    "battery",
+    "time",
+    "date",
+    "draw",
+    "temp",
+    "temperature",
+    "wifi",
+    "wi-fi",
+    "signal",
+  ];
+  let hits = 0;
+  for (const k of keyHints) {
+    if (tail.includes(k)) hits += 1;
+  }
+  if (hits < 4) return text;
+  return text.slice(0, q + 1).trim();
 }

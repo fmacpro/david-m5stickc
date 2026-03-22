@@ -50,19 +50,29 @@ export async function handleSttRaw(request: Request, env: Env): Promise<Response
     return json({ error: "Audio body too small" }, 400);
   }
 
+  const url = new URL(request.url);
+  const promptHintRaw = (url.searchParams.get("prompt") || "").trim();
+  const promptHint = promptHintRaw.slice(0, 180);
+
   const audioFile = new File([audioBytes], "audio.wav", { type: "audio/wav" });
   const upstream = new FormData();
   upstream.set("file", audioFile, "audio.wav");
   upstream.set("model", env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe");
   upstream.set("language", "en");
+  const promptParts = [
+    "Transcribe spoken British English exactly.",
+    "Preserve full user intent and sentence structure.",
+    "Keep names and numbers accurate (for example: David, Star Trek, Voyager, Kathryn Janeway).",
+    "Do not add words that were not spoken.",
+    "Prefer best-guess words over ellipses.",
+  ];
+  if (promptHint.length > 0) {
+    promptParts.push(`Prior transcript context: ${promptHint}`);
+    promptParts.push("Continue naturally from context without dropping words.");
+  }
   upstream.set(
     "prompt",
-    [
-      "Transcribe spoken British English exactly.",
-      "Preserve full user intent and sentence structure.",
-      "Keep names, numbers, and command words accurate: display, battery, level, time, date, draw, temperature, wifi, David.",
-      "Prefer best-guess words over ellipses.",
-    ].join(" ")
+    promptParts.join(" ")
   );
 
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {

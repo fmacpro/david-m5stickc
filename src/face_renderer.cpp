@@ -21,6 +21,35 @@ constexpr int kMoodHungry = 5;
 constexpr int kReactionPatted = 1;
 constexpr int kReactionFed = 2;
 
+bool splitIntoTwoBalancedLines(const String& text, String& line1, String& line2) {
+  line1 = "";
+  line2 = "";
+  const int n = text.length();
+  if (n < 8) return false;
+
+  int best = -1;
+  int bestScore = 1 << 30;
+  const int mid = n / 2;
+  for (int i = 1; i < n - 1; ++i) {
+    if (text[i] != ' ') continue;
+    const int left = i;
+    const int right = n - i - 1;
+    if (left < 3 || right < 3) continue;
+    const int score = abs(left - mid);
+    if (score < bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  if (best < 0) return false;
+
+  line1 = text.substring(0, best);
+  line2 = text.substring(best + 1);
+  line1.trim();
+  line2.trim();
+  return line1.length() > 0 && line2.length() > 0;
+}
+
 void drawBaseMouthOutline(uint16_t accent) {
   M5.Display.drawRoundRect(56, 49, 36, 8, 4, accent);
 }
@@ -127,12 +156,21 @@ void drawFace(const FaceRenderModel& m) {
       drawCenteredFitText(m.overlay_value, 36, 150, 2, 1, c);
     } else if (m.overlay_mode == "big_value") {
       if (m.overlay_title.length() > 0) drawCenteredFitText(m.overlay_title, 16, 150, 1, 1, c);
-      int maxSize = 2;
-      const size_t n = m.overlay_value.length();
-      if (n <= 4) maxSize = 4;
-      else if (n <= 8) maxSize = 3;
-      const int y = (maxSize >= 4) ? 22 : 30;
-      drawCenteredFitText(m.overlay_value, y, 150, maxSize, 1, c);
+      String line1, line2;
+      if (splitIntoTwoBalancedLines(m.overlay_value, line1, line2)) {
+        // Keep two-line values visually centered on the 80px display.
+        const int top = (m.overlay_title.length() > 0) ? 24 : 26;
+        drawCenteredFitText(line1, top, 156, 2, 1, c);
+        drawCenteredFitText(line2, top + 16, 156, 2, 1, c);
+      } else {
+        int maxSize = 2;
+        const size_t n = m.overlay_value.length();
+        if (n <= 4) maxSize = 4;
+        else if (n <= 8) maxSize = 3;
+        int y = (maxSize >= 4) ? 22 : 30;
+        if (m.overlay_title.length() == 0 && m.overlay_value.length() > 10) y = 26;
+        drawCenteredFitText(m.overlay_value, y, 156, maxSize, 1, c);
+      }
     } else {
       if (m.overlay_title.length() > 0) drawCenteredFitText(m.overlay_title, 16, 150, 1, 1, c);
       drawCenteredFitText(m.overlay_value, 34, 150, 2, 1, c);

@@ -428,9 +428,13 @@ function normalizeScreenAction(raw: string): ScreenAction {
   const allowed = new Set(["none", "big_time", "big_battery", "big_rssi", "big_temp", "big_date", "big_value", "draw"]);
   const mode = allowed.has(modeRaw) ? (modeRaw as ScreenAction["mode"]) : "none";
   if (mode === "none") return { mode: "none" };
-  const title = clipText(obj.title, 20);
+  let title = clipText(obj.title, 20);
   let value = clipText(obj.value, 28);
   let draw = clipText(obj.draw, 420);
+  // Model prompt uses "optional" as schema hint; treat literal "optional" as empty.
+  if (title.toLowerCase() === "optional") title = "";
+  if (value.toLowerCase() === "optional") value = "";
+  if (draw.toLowerCase() === "optional") draw = "";
   if (mode === "draw" && draw.length === 0) {
     draw = clipText(obj.value, 420);
   }
@@ -446,10 +450,19 @@ function normalizeScreenAction(raw: string): ScreenAction {
   const ttlMs = Number.isFinite(ttlRaw)
     ? Math.max(1000, Math.min(15000, Math.trunc(ttlRaw)))
     : 7000;
-  if (mode === "big_value") {
-    value = sanitizeBigValueToken(value);
+  let normalizedMode = mode;
+  if (mode === "big_time" && !looksLikeTimeValue(value)) {
+    normalizedMode = "big_value";
   }
-  return { mode, title, value, draw, percent, charging, ttl_ms: ttlMs };
+  if (normalizedMode === "big_value") {
+    value = sanitizeBigValueToken(value);
+    if (value.length > 10) title = "";
+  }
+  return { mode: normalizedMode, title, value, draw, percent, charging, ttl_ms: ttlMs };
+}
+
+function looksLikeTimeValue(value: string): boolean {
+  return /^\d{1,2}:\d{2}$/.test(value.trim());
 }
 
 export function finalizeScreenAction(
@@ -484,6 +497,14 @@ export function finalizeScreenAction(
         mode: "big_value",
         value: "HI!",
         ttl_ms: 2500,
+      };
+    }
+    const compact = compactReplyValue(reply);
+    if (compact.length > 0 && /\b(who|what)\b/i.test(transcript)) {
+      return {
+        mode: "big_value",
+        value: compact,
+        ttl_ms: 6000,
       };
     }
     return { mode: "none" };
@@ -610,8 +631,10 @@ function sanitizeBigValueToken(input: string): string {
   ) {
     return upper.endsWith("!") ? upper : `${upper}!`;
   }
+  // Preserve short multi-word values (names, compact facts) for centered two-line rendering.
+  if (cleaned.includes(" ")) return cleaned.slice(0, 24);
   const single = (cleaned.match(/[A-Za-z0-9]+/) || [""])[0].toUpperCase();
-  return single.slice(0, 10);
+  return single.slice(0, 12);
 }
 
 function pickDefaultWord(transcript: string): string {
@@ -679,4 +702,16 @@ function parseLooseJsonObject(raw: string): unknown {
 function clipText(v: unknown, maxLen: number): string {
   if (typeof v !== "string") return "";
   return v.replace(/\s+/g, " ").trim().slice(0, maxLen);
+}
+
+function compactReplyValue(reply: string): string {
+  const cleaned = reply
+    .replace(/\*+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.!?]+$/, "");
+  if (!cleaned) return "";
+  if (cleaned.length > 24) return "";
+  if (/^it('?s| is)\b/i.test(cleaned)) return "";
+  return cleaned;
 }
