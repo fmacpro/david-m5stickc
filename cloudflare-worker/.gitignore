@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+wrangler.toml
+!wrangler.toml.example
+.env
+.env.*
+!.env.example
+sample.wav
+tts_test.mp3

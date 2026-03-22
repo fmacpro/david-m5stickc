@@ -1,0 +1,340 @@
+import { downsampleWav16MonoTo8bitRate, uint8ToArrayBuffer } from "../audio/wav";
+import { corsHeaders, json, proxyJson } from "../core/http";
+import {
+  isBatteryIntent,
+  isLikelyTimeMisheardAsBattery,
+  isTimeIntent,
+  stripSttPromptLeak,
+} from "../intent/intent";
+import {
+  fallbackScreenAction,
+  finalizeScreenAction,
+  generateScreenAction,
+  iconScreenActionFromTranscript,
+  sanitizeContextForPrompt,
+} from "../intent/screen";
+import {
+  generateReply,
+  repairTranscript,
+  transcribeFile,
+} from "./openai";
+import {
+  appendHistory,
+  getHistory,
+  getMemoryFacts,
+  parseMemoryCommand,
+  putMemoryFacts,
+  recallMemoryReply,
+} from "./state";
+import type { Env, ScreenAction } from "../types";
+
+export async function handleVoiceTurn(
+  request: Request,
+  env: Env,
+  deviceId: string
+): Promise<Response> {
+  const chunkedTts = request.headers.get("x-tts-chunked") === "1";
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.includes("multipart/form-data")) {
+    return json({ error: "Use multipart/form-data with field 'audio'" }, 400);
+  }
+
+  const form = await request.formData();
+  const audio = form.get("audio");
+  if (!(audio instanceof File)) {
+    return json({ error: "Missing file field: audio" }, 400);
+  }
+  const contextRaw = form.get("context");
+  const sensorContext =
+    typeof contextRaw === "string" ? sanitizeContextForPrompt(contextRaw) : "";
+
+  const sttResp = await transcribeFile(audio, env);
+  if (!sttResp.ok) return sttResp.error;
+  const transcript = sttResp.text.trim();
+  if (!transcript) {
+    return json({ error: "No speech recognized" }, 400);
+  }
+  return completeVoiceTurn(env, deviceId, transcript, sensorContext, chunkedTts);
+}
+
+export async function handleVoiceTurnText(
+  request: Request,
+  env: Env,
+  deviceId: string
+): Promise<Response> {
+  const chunkedTts = request.headers.get("x-tts-chunked") === "1";
+  let payload: { transcript?: string; context?: string };
+  try {
+    payload = (await request.json()) as { transcript?: string; context?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  const transcript = (payload.transcript || "").trim();
+  if (!transcript) return json({ error: "Missing field: transcript" }, 400);
+  const sensorContext =
+    typeof payload.context === "string"
+      ? sanitizeContextForPrompt(payload.context)
+      : "";
+  return completeVoiceTurn(env, deviceId, transcript, sensorContext, chunkedTts);
+}
+
+async function completeVoiceTurn(
+  env: Env,
+  deviceId: string,
+  transcript: string,
+  sensorContext: string,
+  chunkedTts: boolean
+): Promise<Response> {
+  const cleanedOriginalTranscript = stripSttPromptLeak(transcript);
+  const repairedTranscriptRaw = await repairTranscript(env, cleanedOriginalTranscript, sensorContext);
+  const repairedTranscript = stripSttPromptLeak(repairedTranscriptRaw);
+
+  const originalLower = cleanedOriginalTranscript.toLowerCase();
+  const repairedLower = repairedTranscript.toLowerCase();
+  const originalTimeIntent = isTimeIntent(originalLower);
+  const originalBatteryIntent = isBatteryIntent(originalLower);
+  const repairedTimeIntent = isTimeIntent(repairedLower);
+  const repairedBatteryIntent = isBatteryIntent(repairedLower);
+  const timeFromBatteryMishear =
+    isLikelyTimeMisheardAsBattery(originalLower) ||
+    isLikelyTimeMisheardAsBattery(repairedLower);
+
+  const history = await getHistory(env, deviceId);
+  const memory = await getMemoryFacts(env, deviceId);
+  const memCmd = parseMemoryCommand(repairedTranscript);
+  const forcedDrawAction = iconScreenActionFromTranscript(repairedTranscript, sensorContext);
+  let deterministicAction: ScreenAction | null = null;
+
+  let finalReply = "";
+  if (originalBatteryIntent && !originalTimeIntent) {
+    const pct = extractBatteryPercent(sensorContext);
+    const charging = extractCharging(sensorContext);
+    if (pct >= 0) {
+      finalReply = charging
+        ? `Battery is ${pct}% and charging.`
+        : `Battery is ${pct}%.`;
+      deterministicAction = {
+        mode: "big_battery",
+        value: `${pct}%`,
+        percent: pct,
+        charging,
+        ttl_ms: 8000,
+      };
+    } else {
+      finalReply = "I can't read battery level right now.";
+    }
+  } else if (originalTimeIntent) {
+    const hhmm = extractLocalTimeHHMM(sensorContext);
+    if (hhmm.length > 0) {
+      finalReply = `It's ${hhmm} in your local time.`;
+      deterministicAction = { mode: "big_time", value: hhmm, ttl_ms: 8000 };
+    } else {
+      finalReply = "I can't read the local time right now.";
+    }
+  } else if (repairedBatteryIntent && !repairedTimeIntent) {
+    const pct = extractBatteryPercent(sensorContext);
+    const charging = extractCharging(sensorContext);
+    if (pct >= 0) {
+      finalReply = charging
+        ? `Battery is ${pct}% and charging.`
+        : `Battery is ${pct}%.`;
+      deterministicAction = {
+        mode: "big_battery",
+        value: `${pct}%`,
+        percent: pct,
+        charging,
+        ttl_ms: 8000,
+      };
+    } else {
+      finalReply = "I can't read battery level right now.";
+    }
+  } else if (repairedTimeIntent || timeFromBatteryMishear) {
+    const hhmm = extractLocalTimeHHMM(sensorContext);
+    if (hhmm.length > 0) {
+      finalReply = `It's ${hhmm} in your local time.`;
+      deterministicAction = { mode: "big_time", value: hhmm, ttl_ms: 8000 };
+    } else {
+      finalReply = "I can't read the local time right now.";
+    }
+  } else if (memCmd.action === "remember") {
+    const next = memory.includes(memCmd.fact)
+      ? memory
+      : [...memory, memCmd.fact].slice(-8);
+    await putMemoryFacts(env, deviceId, next);
+    finalReply = "Got it, I will remember that.";
+  } else if (memCmd.action === "forget_all") {
+    await putMemoryFacts(env, deviceId, []);
+    finalReply = "Done, I cleared what I remembered.";
+  } else if (memCmd.action === "recall") {
+    finalReply = recallMemoryReply(memory);
+  } else if (forcedDrawAction) {
+    finalReply = sanitizeDrawReplySpeech(repairedTranscript);
+  } else {
+    const reply = await generateReply(
+      env,
+      repairedTranscript,
+      history,
+      sensorContext,
+      memory
+    );
+    if (!reply.ok) return reply.error;
+    const maxReplyCharsRaw = parseInt(env.MAX_REPLY_CHARS || "420", 10);
+    const maxReplyChars = Number.isFinite(maxReplyCharsRaw)
+      ? Math.max(120, Math.min(900, maxReplyCharsRaw))
+      : 420;
+    const maxReplyWords = Math.max(20, Math.min(90, Math.floor(maxReplyChars / 6)));
+    finalReply = normalizeReply(reply.text, maxReplyWords, maxReplyChars);
+  }
+
+  await appendHistory(env, deviceId, { user: repairedTranscript, assistant: finalReply }, history);
+  const screenAction = deterministicAction
+    ? deterministicAction
+    : forcedDrawAction
+    ? forcedDrawAction
+    : await generateScreenAction(
+        env,
+        repairedTranscript,
+        finalReply,
+        sensorContext
+      );
+
+  const safeScreenAction =
+    screenAction.mode === "none"
+      ? fallbackScreenAction(repairedTranscript, finalReply, sensorContext)
+      : screenAction;
+  const finalizedScreenAction = finalizeScreenAction(
+    safeScreenAction,
+    repairedTranscript,
+    finalReply,
+    sensorContext
+  );
+  if (finalizedScreenAction.mode === "draw") {
+    finalReply = sanitizeDrawReplySpeech(repairedTranscript);
+  }
+
+  if (chunkedTts) {
+    const headers = new Headers();
+    headers.set("Cache-Control", "no-store");
+    headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
+    headers.set("x-reply", encodeHeaderValue(finalReply, 1200));
+    headers.set(
+      "x-screen",
+      encodeHeaderValue(JSON.stringify(finalizedScreenAction), 700)
+    );
+    for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
+    return new Response(null, { status: 204, headers });
+  }
+
+  const ttsResp = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: env.TTS_MODEL || "gpt-4o-mini-tts",
+      voice: env.TTS_VOICE || "alloy",
+      response_format: "wav",
+      speed: 1.0,
+      instructions:
+        env.TTS_INSTRUCTIONS ||
+        "Speak with a warm British English accent, lower pitch, calm pacing, and clear articulation.",
+      input: finalReply,
+    }),
+  });
+
+  const audioBytes = await ttsResp.arrayBuffer();
+  if (!ttsResp.ok) {
+    const errText = new TextDecoder().decode(audioBytes);
+    return proxyJson(ttsResp.status, errText);
+  }
+
+  const rawBytes = new Uint8Array(audioBytes);
+  const looksLikeWav =
+    rawBytes.byteLength >= 12 &&
+    rawBytes[0] === 0x52 &&
+    rawBytes[1] === 0x49 &&
+    rawBytes[2] === 0x46 &&
+    rawBytes[3] === 0x46 &&
+    rawBytes[8] === 0x57 &&
+    rawBytes[9] === 0x41 &&
+    rawBytes[10] === 0x56 &&
+    rawBytes[11] === 0x45;
+  const compactAudio = looksLikeWav
+    ? downsampleWav16MonoTo8bitRate(rawBytes, 8000)
+    : rawBytes;
+
+  const headers = new Headers();
+  headers.set("Content-Type", ttsResp.headers.get("content-type") || "audio/wav");
+  headers.set("Cache-Control", "no-store");
+  headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
+  headers.set("x-reply", encodeHeaderValue(finalReply));
+  headers.set(
+    "x-screen",
+    encodeHeaderValue(JSON.stringify(finalizedScreenAction), 700)
+  );
+  for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
+  return new Response(uint8ToArrayBuffer(compactAudio), { status: 200, headers });
+}
+
+function normalizeReply(text: string, maxWords = 20, maxChars = 120): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  const words = cleaned.split(" ").filter(Boolean);
+  let capped = words.length > maxWords ? words.slice(0, maxWords).join(" ") : cleaned;
+  if (capped.length > maxChars) capped = capped.slice(0, maxChars).trim();
+  const endsWithPunct = /[.!?]$/.test(capped);
+  return endsWithPunct ? capped : `${capped}.`;
+}
+
+function sanitizeDrawReplySpeech(transcript: string): string {
+  const t = transcript.toLowerCase();
+  if (
+    t.includes("draw") ||
+    t.includes("sketch") ||
+    t.includes("show on screen") ||
+    t.includes("display on screen")
+  ) {
+    return "Sure, drawing that now.";
+  }
+  return "Drawing now.";
+}
+
+function encodeHeaderValue(input: string, maxLen = 220): string {
+  return encodeURIComponent(input.slice(0, maxLen));
+}
+
+function extractLocalTimeHHMM(sensorContextRaw: string): string {
+  if (!sensorContextRaw) return "";
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    const local = parsed.local_time_24h;
+    if (typeof local !== "string") return "";
+    const m = local.match(/\b(\d{2}:\d{2})/);
+    return m ? m[1] : "";
+  } catch {
+    return "";
+  }
+}
+
+function extractBatteryPercent(sensorContextRaw: string): number {
+  if (!sensorContextRaw) return -1;
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    const v = Number(parsed.battery_level);
+    if (!Number.isFinite(v)) return -1;
+    return Math.max(0, Math.min(100, Math.trunc(v)));
+  } catch {
+    return -1;
+  }
+}
+
+function extractCharging(sensorContextRaw: string): boolean {
+  if (!sensorContextRaw) return false;
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    return Boolean(parsed.charging);
+  } catch {
+    return false;
+  }
+}
