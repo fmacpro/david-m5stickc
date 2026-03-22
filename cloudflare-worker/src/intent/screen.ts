@@ -484,10 +484,19 @@ export function finalizeScreenAction(
   const iconAction = iconScreenActionFromTranscript(transcript, sensorContextRaw);
   if (iconAction) return iconAction;
 
-  if (action.mode === "big_time" && action.value && action.value.length > 0) {
+  if (
+    action.mode === "big_time" &&
+    asksTime &&
+    action.value &&
+    action.value.length > 0
+  ) {
     return action;
   }
-  if (action.mode === "big_battery" && (action.percent ?? -1) >= 0) {
+  if (
+    action.mode === "big_battery" &&
+    asksBattery &&
+    (action.percent ?? -1) >= 0
+  ) {
     return action;
   }
 
