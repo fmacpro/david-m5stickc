@@ -9,6 +9,12 @@
 
 namespace {
 constexpr time_t kMinValidUnix = 1700000000;
+
+String canonicalPathOnly(const String& path) {
+  const int q = path.indexOf('?');
+  if (q < 0) return path;
+  return path.substring(0, q);
+}
 }
 
 bool cloudSyncTime(CloudLogFn log_fn) {
@@ -53,7 +59,7 @@ bool cloudSignedPost(
   const String body_hash = sha256Hex(body, body_len);
   const String ts = String(static_cast<long>(now));
   const String nonce = nonceHex();
-  const String canonical = ts + "." + nonce + ".POST." + path + "." + body_hash;
+  const String canonical = ts + "." + nonce + ".POST." + canonicalPathOnly(path) + "." + body_hash;
   const String signature = hmacSha256Hex(cfg.device_shared_secret, canonical);
 
   WiFiClientSecure client;

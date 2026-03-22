@@ -28,15 +28,15 @@ static constexpr size_t kRecordMsMin = 550;
 static constexpr size_t kRecordMsMax = 3200;
 static constexpr size_t kRecordSamplesMin = (kSampleRate * kRecordMsMin) / 1000;
 static constexpr size_t kRecordSamplesMax = (kSampleRate * kRecordMsMax) / 1000;
-static constexpr size_t kSttChunkMs = 1800;
+static constexpr size_t kSttChunkMs = 1400;
 static constexpr size_t kSttChunkSamples = (kSampleRate * kSttChunkMs) / 1000;
 static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
-static constexpr size_t kMinTurnCaptureMs = 3200;
+static constexpr size_t kMinTurnCaptureMs = 2400;
 static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
 static constexpr int kSttChunkMaxCount = 16; // ~32s max hold-to-talk capture
 static constexpr size_t kRecordChunk = 512;
 static constexpr size_t kMicWarmupMs = 60;
-static constexpr size_t kReleaseTailMs = 800;
+static constexpr size_t kReleaseTailMs = 450;
 // Mic front-end tuning for better STT clarity on natural speech/accents.
 static constexpr int kMicMagnification = 30;
 static constexpr int kMicNoiseFilterLevel = 1;
@@ -895,7 +895,6 @@ static bool transcribeAudioSamples(
     String& text,
     String& err,
     size_t& used_samples_out) {
-  (void)stt_prompt;
   used_samples_out = 0;
   const size_t base = (sample_count > 0) ? sample_count : kRecordSamplesMin;
   const size_t sample_opts[] = {
@@ -947,27 +946,67 @@ static bool transcribeAudioSamples(
     logLine(String("[STT] multipart fallback samples=") + String(used_samples) + "/" + String(base));
   }
 
-  String payload;
-  int code = 0;
-  String http_err;
-  const bool ok = signedPost("/v1/stt-raw", "audio/wav", body, body_len, payload, code, http_err);
-  if (!ok) {
-    err = http_err;
-    return false;
-  }
-  if (code != 200) {
-    err = "STT HTTP " + String(code) + " " + truncateForScreen(payload, 60);
-    return false;
-  }
+  auto parseText = [&](const String& raw, String& out_text, String& out_err) -> bool {
+    JsonDocument doc;
+    const auto jerr = deserializeJson(doc, raw);
+    if (jerr) {
+      out_err = String("STT json ") + jerr.c_str();
+      return false;
+    }
+    out_text = doc["text"] | "";
+    return true;
+  };
 
-  JsonDocument doc;
-  const auto jerr = deserializeJson(doc, payload);
-  if (jerr) {
-    err = String("STT json ") + jerr.c_str();
-    return false;
+  auto sttCall = [&](String& out_text, String& out_err) -> bool {
+    String payload;
+    int code = 0;
+    String http_err;
+    String stt_path = "/v1/stt-raw";
+    if (stt_prompt.length() > 0) {
+      String hint = stt_prompt;
+      hint.trim();
+      if (hint.length() > 160) hint = hint.substring(hint.length() - 160);
+      stt_path += "?prompt=";
+      stt_path += urlEncode(hint);
+    }
+    const bool ok = signedPost(stt_path, "audio/wav", body, body_len, payload, code, http_err);
+    if (!ok) {
+      out_err = http_err;
+      return false;
+    }
+    if (code != 200) {
+      out_err = "STT HTTP " + String(code) + " " + truncateForScreen(payload, 60);
+      return false;
+    }
+    return parseText(payload, out_text, out_err);
+  };
+
+  String first_text;
+  if (!sttCall(first_text, err)) return false;
+  text = first_text;
+  text.trim();
+
+  auto hasEllipsis = [](const String& s) -> bool {
+    return s.indexOf("...") >= 0 || s.indexOf("…") >= 0;
+  };
+
+  // If STT emits ellipsis/truncation markers, retry once on the same audio and
+  // keep the stronger result (prefer non-ellipsis and longer text).
+  if (text.length() > 0 && hasEllipsis(text)) {
+    String retry_text;
+    String retry_err;
+    if (sttCall(retry_text, retry_err)) {
+      retry_text.trim();
+      const bool base_has_ellipsis = hasEllipsis(text);
+      const bool retry_has_ellipsis = hasEllipsis(retry_text);
+      if (retry_text.length() > 0 &&
+          ((base_has_ellipsis && !retry_has_ellipsis) ||
+           (retry_text.length() > text.length() + 2))) {
+        logLine(String("[STT] retry improved: \"") + text + "\" -> \"" + retry_text + "\"");
+        text = retry_text;
+      }
+    }
   }
-  text = doc["text"] | "";
-  if (text.length() == 0) return true;
   return true;
 }
 
