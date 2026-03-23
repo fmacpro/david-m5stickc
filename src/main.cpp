@@ -608,28 +608,72 @@ static void applyScreenAction(const String& encoded_json) {
   drawFace();
 }
 
-static bool connectWifi() {
-  WiFi.mode(WIFI_STA);
-  logLine(String("[WiFi] Connecting to SSID: ") + WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  const unsigned long start = millis();
+static const char* wifiStatusLabel(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SHIELD: return "WL_NO_SHIELD";
+    case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED: return "WL_CONNECTED";
+    case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED: return "WL_DISCONNECTED";
+    default: return "WL_UNKNOWN";
+  }
+}
 
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+static bool waitForWifiConnection(unsigned long timeout_ms) {
+  const unsigned long start = millis();
+  wl_status_t last_status = WL_IDLE_STATUS;
+  while (millis() - start < timeout_ms) {
+    const wl_status_t status = WiFi.status();
+    if (status == WL_CONNECTED) return true;
     setUi(FaceState::Connecting, "Connecting WiFi...", String(".") + String((millis() / 400) % 4));
-    if (millis() - g_last_wifi_log_ms > 1000) {
+    if (status != last_status || (millis() - g_last_wifi_log_ms > 1000)) {
       g_last_wifi_log_ms = millis();
-      logLine(String("[WiFi] status=") + String(WiFi.status()));
+      logLine(
+          String("[WiFi] status=") + String(static_cast<int>(status)) +
+          " (" + wifiStatusLabel(status) + ")");
+      last_status = status;
     }
     delay(200);
   }
+  return false;
+}
 
-  if (WiFi.status() == WL_CONNECTED) {
+static bool connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  // Force a clean station state so reconnecting after SSID/password changes
+  // does not get stuck on stale AP metadata.
+  WiFi.disconnect(true, true);
+  delay(250);
+  WiFi.mode(WIFI_STA);
+
+  logLine(String("[WiFi] Connecting to SSID: ") + WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  if (!waitForWifiConnection(20000)) {
+    logLine(String("[WiFi] first attempt failed, retrying clean begin; status=") +
+            wifiStatusLabel(WiFi.status()));
+    WiFi.disconnect(true, true);
+    delay(350);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  if (waitForWifiConnection(20000)) {
     logLine(String("[WiFi] Connected. IP=") + WiFi.localIP().toString());
+    logLine(String("[WiFi] RSSI=") + String(WiFi.RSSI()) +
+            " dBm channel=" + String(WiFi.channel()));
     setUi(FaceState::Idle, "WiFi connected", WiFi.localIP().toString());
     return true;
   }
 
-  logLine("[WiFi] Connection failed");
+  logLine(String("[WiFi] Connection failed. final_status=") +
+          String(static_cast<int>(WiFi.status())) + " (" + wifiStatusLabel(WiFi.status()) + ")");
   setUi(FaceState::Error, "WiFi failed", "Check ssid/password");
   return false;
 }
