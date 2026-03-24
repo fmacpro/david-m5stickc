@@ -213,6 +213,10 @@ export function iconScreenActionFromTranscript(
   transcript: string,
   sensorContextRaw: string
 ): ScreenAction | null {
+  const lower = transcript.toLowerCase();
+  if (lower.includes("picture") || lower.includes("photo") || lower.includes("image")) {
+    return null;
+  }
   if (!wantsDrawIntent(transcript)) return null;
   const name = pickIconNameFromTranscript(transcript);
   if (!name) return null;
@@ -427,7 +431,7 @@ function normalizeScreenAction(raw: string): ScreenAction {
   if (!parsed || typeof parsed !== "object") return { mode: "none" };
   const obj = parsed as Record<string, unknown>;
   const modeRaw = typeof obj.mode === "string" ? obj.mode : "none";
-  const allowed = new Set(["none", "big_time", "big_battery", "big_rssi", "big_temp", "big_date", "big_value", "draw"]);
+  const allowed = new Set(["none", "big_time", "big_battery", "big_rssi", "big_temp", "big_date", "big_value", "draw", "image"]);
   const mode = allowed.has(modeRaw) ? (modeRaw as ScreenAction["mode"]) : "none";
   if (mode === "none") return { mode: "none" };
   let title = clipText(obj.title, 20);
@@ -442,6 +446,9 @@ function normalizeScreenAction(raw: string): ScreenAction {
   }
   if (mode === "draw") {
     draw = sanitizeDrawScript(draw);
+  }
+  if (mode === "image") {
+    value = clipText(obj.value, 80);
   }
   const percentRaw = Number(obj.percent);
   const percent = Number.isFinite(percentRaw)
@@ -485,6 +492,14 @@ export function finalizeScreenAction(
   const allowDisplay = visualIntent || topicIntent;
   const iconAction = iconScreenActionFromTranscript(transcript, sensorContextRaw);
   if (iconAction) return iconAction;
+
+  if (action.mode === "image" && action.value && action.value.length > 0) {
+    return {
+      mode: "image",
+      value: action.value,
+      ttl_ms: action.ttl_ms ?? 12000,
+    };
+  }
 
   if (
     action.mode === "big_time" &&

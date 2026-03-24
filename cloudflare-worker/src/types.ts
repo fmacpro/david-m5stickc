@@ -34,7 +34,8 @@ export type ScreenAction = {
     | "big_temp"
     | "big_date"
     | "big_value"
-    | "draw";
+    | "draw"
+    | "image";
   title?: string;
   value?: string;
   draw?: string;

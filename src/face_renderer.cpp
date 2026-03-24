@@ -1,5 +1,7 @@
 #include "face_renderer.h"
 
+#include <SPIFFS.h>
+
 #include "ui_draw_utils.h"
 
 namespace {
@@ -107,6 +109,25 @@ void drawFace(const FaceRenderModel& m) {
     const uint16_t c = GREEN;
     if (m.overlay_mode == "draw") {
       drawCenteredScript(m.overlay_draw, c);
+    } else if (m.overlay_mode == "image") {
+      if (m.overlay_value.length() > 0) {
+        File f = SPIFFS.open(m.overlay_value, FILE_READ);
+        const size_t len = f ? static_cast<size_t>(f.size()) : 0;
+        if (!f || len < 256 || len > 150000) {
+          drawCenteredFitText("IMAGE ERR", 30, 150, 2, 1, c);
+        } else {
+          uint8_t* jpg = static_cast<uint8_t*>(malloc(len));
+          size_t got = 0;
+          if (jpg) got = f.read(jpg, len);
+          f.close();
+          if (!jpg || got != len || !M5.Display.drawJpg(jpg, got, 0, 0)) {
+            drawCenteredFitText("IMAGE ERR", 30, 150, 2, 1, c);
+          }
+          if (jpg) free(jpg);
+        }
+      } else {
+        drawCenteredFitText("NO IMAGE", 30, 150, 2, 1, c);
+      }
     } else if (m.overlay_mode == "big_time") {
       drawCenteredFitText(m.overlay_value, 24, 150, 4, 2, c);
     } else if (m.overlay_mode == "big_battery") {

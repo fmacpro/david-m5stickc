@@ -85,6 +85,7 @@ static bool g_btnb_long_handled = false;
 static String g_serial_cmd_buf = "";
 static bool g_fs_ready = false;
 static int16_t g_preroll_buf[kPreRollSamples];
+static constexpr const char* kOverlayImagePath = "/overlay_img.jpg";
 static uint32_t g_voice_turn_seq = 0;
 static uint32_t g_voice_turn_active = 0;
 static ReactionKind g_reaction = ReactionKind::None;
@@ -127,6 +128,13 @@ static bool requestVoiceTurnText(
     String& transcript,
     String& reply,
     String& screen_action,
+    String& err);
+static bool requestPictureJpeg(
+    const String& query,
+    uint8_t*& jpg_out,
+    size_t& jpg_len,
+    String& image_title,
+    String& image_source,
     String& err);
 static bool requestVoiceTurnAudio(
     uint8_t*& wav_out,
@@ -543,6 +551,56 @@ static void applyScreenAction(const String& encoded_json) {
       clearOverlay();
       drawFace();
       return;
+    }
+  } else if (mode == "image") {
+    if (!g_fs_ready) {
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    String query = value;
+    query.trim();
+    if (query.length() == 0) {
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    uint8_t* jpg = nullptr;
+    size_t jpg_len = 0;
+    String img_title;
+    String img_source;
+    String img_err;
+    if (!requestPictureJpeg(query, jpg, jpg_len, img_title, img_source, img_err)) {
+      logLine(String("[SCREEN] image fetch failed: ") + img_err);
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    if (SPIFFS.exists(kOverlayImagePath)) SPIFFS.remove(kOverlayImagePath);
+    File f = SPIFFS.open(kOverlayImagePath, FILE_WRITE);
+    if (!f) {
+      if (jpg) free(jpg);
+      logLine("[SCREEN] image file open failed");
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    const size_t wrote = f.write(jpg, jpg_len);
+    f.close();
+    if (jpg) free(jpg);
+    if (wrote != jpg_len) {
+      if (SPIFFS.exists(kOverlayImagePath)) SPIFFS.remove(kOverlayImagePath);
+      logLine("[SCREEN] image file write failed");
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    value = kOverlayImagePath;
+    if (img_title.length() > 0) {
+      logLine(String("[SCREEN] image title=") + truncateForScreen(img_title, 72));
+    }
+    if (img_source.length() > 0) {
+      logLine(String("[SCREEN] image src=") + truncateForScreen(img_source, 96));
     }
   } else {
     clearOverlay();
@@ -1348,6 +1406,107 @@ static bool requestTtsWav(const String& text, uint8_t*& wav_out, size_t& wav_len
     free(wav_out);
     wav_out = nullptr;
     err = "Unsupported audio type: " + resp_type;
+    return false;
+  }
+  return true;
+}
+
+static bool requestPictureJpeg(
+    const String& query,
+    uint8_t*& jpg_out,
+    size_t& jpg_len,
+    String& image_title,
+    String& image_source,
+    String& err) {
+  jpg_out = nullptr;
+  jpg_len = 0;
+  image_title = "";
+  image_source = "";
+
+  String q = query;
+  q.trim();
+  if (q.length() == 0) {
+    err = "Empty picture query";
+    return false;
+  }
+  if (q.length() > 80) q = q.substring(0, 80);
+  const String body_str = String("{\"query\":\"") + jsonEscape(q) + "\"}";
+  uint8_t* body = reinterpret_cast<uint8_t*>(const_cast<char*>(body_str.c_str()));
+
+  time_t now = time(nullptr);
+  if (now < 1700000000 && !syncTime()) {
+    err = "NTP sync failed";
+    return false;
+  }
+  now = time(nullptr);
+  const String path = "/v1/picture";
+  const String body_hash = sha256Hex(body, body_str.length());
+  const String ts = String(static_cast<long>(now));
+  const String nonce = nonceHex();
+  const String canonical = ts + "." + nonce + ".POST." + path + "." + body_hash;
+  const String signature = hmacSha256Hex(DEVICE_SHARED_SECRET, canonical);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, String(API_BASE_URL) + path)) {
+    err = "http begin failed";
+    return false;
+  }
+  http.setConnectTimeout(9000);
+  http.setTimeout(30000);
+  const char* header_keys[] = {"Content-Type", "x-image-title", "x-image-source"};
+  http.collectHeaders(header_keys, 3);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-timestamp", ts);
+  http.addHeader("x-nonce", nonce);
+  http.addHeader("x-signature", signature);
+
+  const int code = http.POST(body, body_str.length());
+  logLine(String("[HTTP] /v1/picture -> ") + String(code) + " q=" + q);
+  if (code != 200) {
+    const String payload = http.getString();
+    logLine(String("[PICTURE ERROR PAYLOAD] ") + truncateForScreen(payload, 220));
+    http.end();
+    err = "PICTURE HTTP " + String(code) + " " + truncateForScreen(payload, 60);
+    return false;
+  }
+
+  const String resp_type = http.header("Content-Type");
+  if (resp_type.indexOf("image/jpeg") < 0) {
+    const String payload = http.getString();
+    http.end();
+    err = "Unexpected image type: " + resp_type + " " + truncateForScreen(payload, 50);
+    return false;
+  }
+
+  image_title = urlDecode(http.header("x-image-title"));
+  image_source = urlDecode(http.header("x-image-source"));
+
+  const int len = http.getSize();
+  const size_t kImageCap = 140000;
+  if (len <= 0 || len > static_cast<int>(kImageCap)) {
+    http.end();
+    err = "Picture too large";
+    return false;
+  }
+  jpg_out = static_cast<uint8_t*>(malloc(static_cast<size_t>(len)));
+  if (!jpg_out) {
+    http.end();
+    err = "OOM picture";
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t got = 0;
+  const bool full = readFully(*stream, jpg_out, static_cast<size_t>(len), 6000, got);
+  http.end();
+  jpg_len = got;
+  if (!full || jpg_len < 256) {
+    free(jpg_out);
+    jpg_out = nullptr;
+    jpg_len = 0;
+    err = "Picture read failed";
     return false;
   }
   return true;

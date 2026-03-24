@@ -1,6 +1,7 @@
 import { downsampleWav16MonoTo8bitRate, uint8ToArrayBuffer } from "../audio/wav";
 import { corsHeaders, json, proxyJson } from "../core/http";
 import {
+  extractPictureQuery,
   isBatteryIntent,
   isDrawIntent,
   isTimeIntent,
@@ -114,13 +115,17 @@ async function completeVoiceTurn(
   const repairedTimeIntent = isTimeIntent(repairedLower);
   const repairedBatteryIntent = isBatteryIntent(repairedLower);
   const repairedDrawIntent = isDrawIntent(repairedLower);
+  const pictureQuery =
+    extractPictureQuery(repairedTranscript) ||
+    extractPictureQuery(cleanedOriginalTranscript);
 
   const history = await getHistory(env, deviceId);
   const memory = await getMemoryFacts(env, deviceId);
   const memCmd = parseMemoryCommand(repairedTranscript);
-  const forcedDrawAction =
-    iconScreenActionFromTranscript(repairedTranscript, sensorContext) ||
-    iconScreenActionFromTranscript(cleanedOriginalTranscript, sensorContext);
+  const forcedDrawAction = pictureQuery
+    ? null
+    : iconScreenActionFromTranscript(repairedTranscript, sensorContext) ||
+      iconScreenActionFromTranscript(cleanedOriginalTranscript, sensorContext);
   let deterministicAction: ScreenAction | null = null;
 
   let finalReply = "";
@@ -138,7 +143,7 @@ async function completeVoiceTurn(
     (wantsTime ? 1 : 0) +
     (wantsBattery ? 1 : 0);
 
-  if (statusIntentCount >= 2 && !originalDrawIntent && !repairedDrawIntent) {
+  if (!pictureQuery && statusIntentCount >= 2 && !originalDrawIntent && !repairedDrawIntent) {
     const parts: string[] = [];
     if (wantsDate) {
       const localDate = extractLocalDate(sensorContext);
@@ -168,7 +173,10 @@ async function completeVoiceTurn(
     }
   }
 
-  if (!finalReply && originalBatteryIntent && !originalTimeIntent && !originalDrawIntent) {
+  if (!finalReply && pictureQuery) {
+    finalReply = `Showing a picture of ${pictureQuery}.`;
+    deterministicAction = { mode: "image", value: pictureQuery, ttl_ms: 12000 };
+  } else if (!finalReply && originalBatteryIntent && !originalTimeIntent && !originalDrawIntent) {
     const pct = extractBatteryPercent(sensorContext);
     const charging = extractCharging(sensorContext);
     if (pct >= 0) {

@@ -1,5 +1,6 @@
 import { json, withCors } from "./core/http";
 import { handleChat } from "./routes/chat";
+import { handlePicture } from "./routes/picture";
 import { handleTts } from "./routes/tts";
 import { authenticate, enforceRateLimit } from "./security/auth";
 import { sha256Hex } from "./security/crypto";
@@ -68,6 +69,9 @@ export default {
         return withCors(
           await handleVoiceTurnText(reqForParsing, env, authResult.deviceId)
         );
+      }
+      if (url.pathname === "/v1/picture") {
+        return withCors(await handlePicture(reqForParsing, env));
       }
 
       return json({ error: "Not found" }, 404);
