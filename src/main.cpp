@@ -84,6 +84,8 @@ static unsigned long g_btnb_down_ms = 0;
 static bool g_btnb_long_handled = false;
 static String g_serial_cmd_buf = "";
 static bool g_fs_ready = false;
+static uint8_t g_mic_magnification = kMicMagnification;
+static uint8_t g_mic_noise_filter_level = kMicNoiseFilterLevel;
 static int16_t g_preroll_buf[kPreRollSamples];
 static constexpr const char* kOverlayImagePath = "/overlay_img.jpg";
 static uint32_t g_voice_turn_seq = 0;
@@ -170,6 +172,21 @@ static void stopMicIfNeeded() {
   while (M5.Mic.isRecording()) M5.delay(1);
   M5.Mic.end();
   g_mic_started = false;
+}
+
+static void applyMicConfig(uint8_t magnification, uint8_t noise_filter_level) {
+  const uint8_t mag = (magnification < 1) ? 1 : ((magnification > 64) ? 64 : magnification);
+  const uint8_t nf = (noise_filter_level > 4) ? 4 : noise_filter_level;
+  g_mic_magnification = mag;
+  g_mic_noise_filter_level = nf;
+  stopMicIfNeeded();
+  auto mic_cfg = M5.Mic.config();
+  mic_cfg.magnification = g_mic_magnification;
+  mic_cfg.noise_filter_level = g_mic_noise_filter_level;
+  M5.Mic.config(mic_cfg);
+  startMicIfNeeded();
+  logLine(String("[MIC] magnification=") + String(g_mic_magnification) +
+          " noise_filter=" + String(g_mic_noise_filter_level));
 }
 
 static void setLowPowerIdle(bool enable) {
@@ -2133,7 +2150,33 @@ static void handleSerialDebugInput() {
       continue;
     }
     if (line == "HELP") {
-      logLine("[SERIAL CMD] use: ASK <question>");
+      logLine("[SERIAL CMD] use: ASK <question> | MIC? | MICCFG <mag 1..64> <nf 0..4>");
+      continue;
+    }
+    if (line == "MIC?") {
+      logLine(String("[MIC] magnification=") + String(g_mic_magnification) +
+              " noise_filter=" + String(g_mic_noise_filter_level));
+      continue;
+    }
+    if (line.startsWith("MICCFG ")) {
+      String rest = line.substring(7);
+      rest.trim();
+      const int sep = rest.indexOf(' ');
+      if (sep <= 0) {
+        logLine("[SERIAL CMD] use: MICCFG <mag 1..64> <nf 0..4>");
+        continue;
+      }
+      String mag_s = rest.substring(0, sep);
+      String nf_s = rest.substring(sep + 1);
+      mag_s.trim();
+      nf_s.trim();
+      const int mag = mag_s.toInt();
+      const int nf = nf_s.toInt();
+      if (mag < 1 || mag > 64 || nf < 0 || nf > 4) {
+        logLine("[SERIAL CMD] invalid MICCFG range");
+        continue;
+      }
+      applyMicConfig(static_cast<uint8_t>(mag), static_cast<uint8_t>(nf));
       continue;
     }
     if (line.startsWith("ASK ")) {
@@ -2210,12 +2253,8 @@ void setup() {
     logLine("[NTP] boot sync failed; continuing and will retry on demand");
   }
 
-  auto mic_cfg = M5.Mic.config();
   // Favor intelligibility over aggressive denoise; helps longer natural questions.
-  mic_cfg.magnification = kMicMagnification;
-  mic_cfg.noise_filter_level = kMicNoiseFilterLevel;
-  M5.Mic.config(mic_cfg);
-  startMicIfNeeded();
+  applyMicConfig(g_mic_magnification, g_mic_noise_filter_level);
   setUi(FaceState::Idle, "Ready", "BtnA: talk");
 }
 

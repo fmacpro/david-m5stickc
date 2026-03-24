@@ -27,6 +27,10 @@ export async function appendHistory(
   });
 }
 
+export async function clearHistory(env: Env, deviceId: string): Promise<void> {
+  await env.DEVICE_STATE.delete(`history:${deviceId}`);
+}
+
 export async function getMemoryFacts(env: Env, deviceId: string): Promise<string[]> {
   const raw = await env.DEVICE_STATE.get(`memory:${deviceId}`);
   if (!raw) return [];

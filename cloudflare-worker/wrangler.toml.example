@@ -9,6 +9,7 @@ id = "REPLACE_WITH_YOUR_DEVICE_STATE_NAMESPACE_ID"
 [vars]
 CHAT_MODEL = "gpt-5.4-nano"
 TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+TRANSCRIBE_LANGUAGE = "en"
 TTS_MODEL = "gpt-4o-mini-tts"
 TTS_VOICE = "fable"
 TTS_INSTRUCTIONS = "Speak in natural British English (RP). Avoid American pronunciation. Keep a slightly deeper tone, calm pace, and clear enunciation."

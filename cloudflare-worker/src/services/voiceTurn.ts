@@ -20,6 +20,7 @@ import {
 } from "./openai";
 import {
   appendHistory,
+  clearHistory,
   getHistory,
   getMemoryFacts,
   parseMemoryCommand,
@@ -105,6 +106,7 @@ async function completeVoiceTurn(
   const history = await getHistory(env, deviceId);
   const memory = await getMemoryFacts(env, deviceId);
   const memCmd = parseMemoryCommand(normalizedTranscript);
+  let shouldAppendHistory = true;
   const forcedDrawAction = pictureQuery
     ? null
     : iconScreenActionFromTranscript(normalizedTranscript, sensorContext);
@@ -189,6 +191,9 @@ async function completeVoiceTurn(
     finalReply = "Got it, I will remember that.";
   } else if (!finalReply && memCmd.action === "forget_all") {
     await putMemoryFacts(env, deviceId, []);
+    await clearHistory(env, deviceId);
+    history.length = 0;
+    shouldAppendHistory = false;
     finalReply = "Done, I cleared what I remembered.";
   } else if (!finalReply && memCmd.action === "recall") {
     finalReply = recallMemoryReply(memory);
@@ -212,7 +217,9 @@ async function completeVoiceTurn(
   }
 
   finalReply = stripSpeechMarkdown(finalReply);
-  await appendHistory(env, deviceId, { user: normalizedTranscript, assistant: finalReply }, history);
+  if (shouldAppendHistory) {
+    await appendHistory(env, deviceId, { user: normalizedTranscript, assistant: finalReply }, history);
+  }
   const screenAction = deterministicAction
     ? deterministicAction
     : forcedDrawAction
