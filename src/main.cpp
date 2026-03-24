@@ -33,7 +33,7 @@ static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
 static constexpr size_t kMinTurnCaptureMs = 1400;
 static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
 static constexpr size_t kRecordChunk = 512;
-static constexpr size_t kMicWarmupMs = 5;
+static constexpr size_t kMicWarmupMs = 0;
 static constexpr size_t kPreRollMs = 150;
 static constexpr size_t kPreRollSamples = (kSampleRate * kPreRollMs) / 1000;
 static constexpr size_t kReleaseTailMs = 50;
@@ -42,7 +42,7 @@ static constexpr size_t kCaptureFileReserveBytes = 12288;
 static constexpr size_t kTurnUploadSoftMaxBytes = 1850000;
 // Mic front-end tuning for better STT clarity on natural speech/accents.
 static constexpr int kMicMagnification = 24;
-static constexpr int kMicNoiseFilterLevel = 2;
+static constexpr int kMicNoiseFilterLevel = 1;
 // Speaker tuning to reduce hiss/static on tiny speaker hats.
 static constexpr int kSpeakerVolume = 185;
 static constexpr bool kVoiceDebug = false;
