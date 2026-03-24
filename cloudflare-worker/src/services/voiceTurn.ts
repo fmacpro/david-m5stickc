@@ -2,7 +2,7 @@ import { downsampleWav16MonoTo8bitRate, uint8ToArrayBuffer } from "../audio/wav"
 import { corsHeaders, json, proxyJson } from "../core/http";
 import {
   isBatteryIntent,
-  isLikelyTimeMisheardAsBattery,
+  isDrawIntent,
   isTimeIntent,
   stripSttPromptLeak,
 } from "../intent/intent";
@@ -54,7 +54,14 @@ export async function handleVoiceTurn(
   if (!transcript) {
     return json({ error: "No speech recognized" }, 400);
   }
-  return completeVoiceTurn(env, deviceId, transcript, sensorContext, chunkedTts);
+  return completeVoiceTurn(
+    env,
+    deviceId,
+    transcript,
+    sensorContext,
+    chunkedTts,
+    sttResp.meta
+  );
 }
 
 export async function handleVoiceTurnText(
@@ -83,7 +90,8 @@ async function completeVoiceTurn(
   deviceId: string,
   transcript: string,
   sensorContext: string,
-  chunkedTts: boolean
+  chunkedTts: boolean,
+  sttMeta?: { sttMs: number; audioBytes: number; model: string }
 ): Promise<Response> {
   const cleanedOriginalTranscript = sanitizeTranscriptIntentNoise(
     stripSttPromptLeak(transcript)
@@ -99,22 +107,68 @@ async function completeVoiceTurn(
 
   const originalLower = cleanedOriginalTranscript.toLowerCase();
   const repairedLower = repairedTranscript.toLowerCase();
+  const combinedLower = `${originalLower} ${repairedLower}`.trim();
   const originalTimeIntent = isTimeIntent(originalLower);
   const originalBatteryIntent = isBatteryIntent(originalLower);
+  const originalDrawIntent = isDrawIntent(originalLower);
   const repairedTimeIntent = isTimeIntent(repairedLower);
   const repairedBatteryIntent = isBatteryIntent(repairedLower);
-  const timeFromBatteryMishear =
-    isLikelyTimeMisheardAsBattery(originalLower) ||
-    isLikelyTimeMisheardAsBattery(repairedLower);
+  const repairedDrawIntent = isDrawIntent(repairedLower);
 
   const history = await getHistory(env, deviceId);
   const memory = await getMemoryFacts(env, deviceId);
   const memCmd = parseMemoryCommand(repairedTranscript);
-  const forcedDrawAction = iconScreenActionFromTranscript(repairedTranscript, sensorContext);
+  const forcedDrawAction =
+    iconScreenActionFromTranscript(repairedTranscript, sensorContext) ||
+    iconScreenActionFromTranscript(cleanedOriginalTranscript, sensorContext);
   let deterministicAction: ScreenAction | null = null;
 
   let finalReply = "";
-  if (originalBatteryIntent && !originalTimeIntent) {
+  const wantsDate = isDateIntent(combinedLower);
+  const wantsWifi = isWifiIntent(combinedLower);
+  const wantsTemp = isTempIntent(combinedLower);
+  const wantsTime =
+    originalTimeIntent ||
+    repairedTimeIntent;
+  const wantsBattery = originalBatteryIntent || repairedBatteryIntent;
+  const statusIntentCount =
+    (wantsDate ? 1 : 0) +
+    (wantsWifi ? 1 : 0) +
+    (wantsTemp ? 1 : 0) +
+    (wantsTime ? 1 : 0) +
+    (wantsBattery ? 1 : 0);
+
+  if (statusIntentCount >= 2 && !originalDrawIntent && !repairedDrawIntent) {
+    const parts: string[] = [];
+    if (wantsDate) {
+      const localDate = extractLocalDate(sensorContext);
+      if (localDate.length > 0) parts.push(`Date is ${localDate}`);
+    }
+    if (wantsTime) {
+      const hhmm = extractLocalTimeHHMM(sensorContext);
+      if (hhmm.length > 0) parts.push(`time is ${hhmm}`);
+    }
+    if (wantsBattery) {
+      const pct = extractBatteryPercent(sensorContext);
+      const charging = extractCharging(sensorContext);
+      if (pct >= 0) {
+        parts.push(charging ? `battery is ${pct}% and charging` : `battery is ${pct}%`);
+      }
+    }
+    if (wantsWifi) {
+      const rssi = extractWifiRssi(sensorContext);
+      if (Number.isFinite(rssi)) parts.push(`Wi-Fi RSSI is ${rssi} dBm`);
+    }
+    if (wantsTemp) {
+      const tempC = extractInternalTempC(sensorContext);
+      if (Number.isFinite(tempC)) parts.push(`internal temperature is ${tempC.toFixed(1)} C`);
+    }
+    if (parts.length > 0) {
+      finalReply = `${parts.join(", ")}.`;
+    }
+  }
+
+  if (!finalReply && originalBatteryIntent && !originalTimeIntent && !originalDrawIntent) {
     const pct = extractBatteryPercent(sensorContext);
     const charging = extractCharging(sensorContext);
     if (pct >= 0) {
@@ -131,7 +185,7 @@ async function completeVoiceTurn(
     } else {
       finalReply = "I can't read battery level right now.";
     }
-  } else if (originalTimeIntent) {
+  } else if (!finalReply && originalTimeIntent && !originalDrawIntent) {
     const hhmm = extractLocalTimeHHMM(sensorContext);
     if (hhmm.length > 0) {
       finalReply = `It's ${hhmm} in your local time.`;
@@ -139,7 +193,7 @@ async function completeVoiceTurn(
     } else {
       finalReply = "I can't read the local time right now.";
     }
-  } else if (repairedBatteryIntent && !repairedTimeIntent) {
+  } else if (!finalReply && repairedBatteryIntent && !repairedTimeIntent && !repairedDrawIntent) {
     const pct = extractBatteryPercent(sensorContext);
     const charging = extractCharging(sensorContext);
     if (pct >= 0) {
@@ -156,7 +210,11 @@ async function completeVoiceTurn(
     } else {
       finalReply = "I can't read battery level right now.";
     }
-  } else if (repairedTimeIntent || timeFromBatteryMishear) {
+  } else if (
+    !finalReply &&
+    repairedTimeIntent &&
+    !repairedDrawIntent
+  ) {
     const hhmm = extractLocalTimeHHMM(sensorContext);
     if (hhmm.length > 0) {
       finalReply = `It's ${hhmm} in your local time.`;
@@ -164,18 +222,18 @@ async function completeVoiceTurn(
     } else {
       finalReply = "I can't read the local time right now.";
     }
-  } else if (memCmd.action === "remember") {
+  } else if (!finalReply && memCmd.action === "remember") {
     const next = memory.includes(memCmd.fact)
       ? memory
       : [...memory, memCmd.fact].slice(-8);
     await putMemoryFacts(env, deviceId, next);
     finalReply = "Got it, I will remember that.";
-  } else if (memCmd.action === "forget_all") {
+  } else if (!finalReply && memCmd.action === "forget_all") {
     await putMemoryFacts(env, deviceId, []);
     finalReply = "Done, I cleared what I remembered.";
-  } else if (memCmd.action === "recall") {
+  } else if (!finalReply && memCmd.action === "recall") {
     finalReply = recallMemoryReply(memory);
-  } else if (forcedDrawAction) {
+  } else if (!finalReply && forcedDrawAction) {
     finalReply = sanitizeDrawReplySpeech(repairedTranscript);
   } else {
     const reply = await generateReply(
@@ -194,6 +252,7 @@ async function completeVoiceTurn(
     finalReply = normalizeReply(reply.text, maxReplyWords, maxReplyChars);
   }
 
+  finalReply = stripSpeechMarkdown(finalReply);
   await appendHistory(env, deviceId, { user: repairedTranscript, assistant: finalReply }, history);
   const screenAction = deterministicAction
     ? deterministicAction
@@ -233,6 +292,11 @@ async function completeVoiceTurn(
       "x-screen",
       encodeHeaderValue(JSON.stringify(finalizedScreenAction), 700)
     );
+    if (sttMeta) {
+      headers.set("x-stt-ms", String(sttMeta.sttMs));
+      headers.set("x-audio-bytes", String(sttMeta.audioBytes));
+      headers.set("x-stt-model", encodeHeaderValue(sttMeta.model, 120));
+    }
     for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
     return new Response(null, { status: 204, headers });
   }
@@ -289,6 +353,11 @@ async function completeVoiceTurn(
     "x-screen",
     encodeHeaderValue(JSON.stringify(finalizedScreenAction), 700)
   );
+  if (sttMeta) {
+    headers.set("x-stt-ms", String(sttMeta.sttMs));
+    headers.set("x-audio-bytes", String(sttMeta.audioBytes));
+    headers.set("x-stt-model", encodeHeaderValue(sttMeta.model, 120));
+  }
   for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
   return new Response(uint8ToArrayBuffer(compactAudio), { status: 200, headers });
 }
@@ -314,6 +383,16 @@ function sanitizeDrawReplySpeech(transcript: string): string {
     return "Sure, drawing that now.";
   }
   return "Drawing now.";
+}
+
+function stripSpeechMarkdown(text: string): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/`(.*?)`/g, "$1")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function encodeHeaderValue(input: string, maxLen = 220): string {
@@ -353,6 +432,67 @@ function extractCharging(sensorContextRaw: string): boolean {
   } catch {
     return false;
   }
+}
+
+function extractWifiRssi(sensorContextRaw: string): number {
+  if (!sensorContextRaw) return Number.NaN;
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    const v = Number(parsed.wifi_rssi);
+    return Number.isFinite(v) ? Math.trunc(v) : Number.NaN;
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function extractInternalTempC(sensorContextRaw: string): number {
+  if (!sensorContextRaw) return Number.NaN;
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    const v = Number(parsed.internal_temp_c);
+    return Number.isFinite(v) ? v : Number.NaN;
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function extractLocalDate(sensorContextRaw: string): string {
+  if (!sensorContextRaw) return "";
+  try {
+    const parsed = JSON.parse(sensorContextRaw) as Record<string, unknown>;
+    const local = parsed.local_time_24h;
+    if (typeof local !== "string") return "";
+    const m = local.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+    return m ? m[1] : "";
+  } catch {
+    return "";
+  }
+}
+
+function isDateIntent(lower: string): boolean {
+  return (
+    lower.includes("what date") ||
+    lower.includes("current date") ||
+    lower.includes("today's date") ||
+    lower.includes("todays date") ||
+    lower.includes("date is it today")
+  );
+}
+
+function isWifiIntent(lower: string): boolean {
+  return (
+    lower.includes("wifi") ||
+    lower.includes("wi-fi") ||
+    lower.includes("signal strength") ||
+    lower.includes("rssi")
+  );
+}
+
+function isTempIntent(lower: string): boolean {
+  return (
+    lower.includes("temperature") ||
+    lower.includes("temp")
+  );
 }
 
 function sanitizeTranscriptIntentNoise(input: string): string {

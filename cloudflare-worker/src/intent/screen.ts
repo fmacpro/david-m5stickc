@@ -1,6 +1,5 @@
 import { extractOutputText } from "../services/openai";
 import type { Env, ScreenAction } from "../types";
-import { isLikelyTimeMisheardAsBattery } from "./intent";
 
 export function sanitizeContextForPrompt(raw: string): string {
   const trimmed = raw.trim();
@@ -140,6 +139,8 @@ function iconScriptByName(name: string, sensorContextRaw = ""): string {
     return "CLS;L 62 20 98 20;L 98 20 114 40;L 114 40 98 60;L 98 60 62 60;L 62 60 46 40;L 46 40 62 20";
   if (n === "smile" || n === "smiley" || n === "face")
     return "CLS;C 80 38 24;D 71 33 2;D 89 33 2;L 68 46 72 50;L 72 50 88 50;L 88 50 92 46";
+  if (n === "cat")
+    return "CLS;D 68 30 8;D 92 30 8;L 60 24 66 16;L 66 16 74 24;L 86 24 94 16;L 94 16 100 24;D 72 38 2;D 88 38 2;D 80 44 2;L 80 44 74 50;L 80 44 86 50";
   if (n === "heart")
     return "CLS;D 71 35 8;D 89 35 8;L 63 39 80 58;L 97 39 80 58;F 72 33 16 8";
   if (n === "clock") return "CLS;C 80 40 24;L 80 40 80 27;L 80 40 91 45;D 80 40 2";
@@ -200,6 +201,7 @@ function pickIconNameFromTranscript(transcript: string): string {
   if (t.includes("sun")) return "sun";
   if (t.includes("moon")) return "moon";
   if (t.includes("heart")) return "heart";
+  if (t.includes("cat") || t.includes("kitten") || t.includes("kitty")) return "cat";
   if (t.includes("check")) return "check";
   if (t.includes("cross") || t.includes(" x ")) return "x";
   if (t.includes("circle")) return "circle";
@@ -472,7 +474,7 @@ export function finalizeScreenAction(
   sensorContextRaw: string
 ): ScreenAction {
   const t = transcript.toLowerCase();
-  const asksTime = /\b(time|clock)\b/.test(t) || isLikelyTimeMisheardAsBattery(t);
+  const asksTime = /\b(time|clock)\b/.test(t);
   const asksBattery = t.includes("battery");
   const asksTemp = t.includes("temp") || t.includes("temperature");
   const asksYear = t.includes("year");

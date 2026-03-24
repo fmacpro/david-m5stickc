@@ -19,27 +19,30 @@
 #include "ui_draw_utils.h"
 #include "voice_turn.h"
 
+#if defined(ARDUINO_ARCH_ESP32)
+// TLS handshakes plus multipart upload path can exceed default loopTask stack.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 enum class FaceState { Idle, Connecting, Recording, Thinking, Speaking, Happy, Error };
 enum class FaceMood { Neutral, Cheerful, Curious, Concerned, Sleepy, Hungry };
 enum class ReactionKind { None, Patted, Fed };
 
 static constexpr uint32_t kSampleRate = 16000;
-static constexpr size_t kRecordMsMin = 550;
-static constexpr size_t kRecordMsMax = 3200;
-static constexpr size_t kRecordSamplesMin = (kSampleRate * kRecordMsMin) / 1000;
-static constexpr size_t kRecordSamplesMax = (kSampleRate * kRecordMsMax) / 1000;
-static constexpr size_t kSttChunkMs = 1400;
-static constexpr size_t kSttChunkSamples = (kSampleRate * kSttChunkMs) / 1000;
 static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
-static constexpr size_t kMinTurnCaptureMs = 2400;
+static constexpr size_t kMinTurnCaptureMs = 1400;
 static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
-static constexpr int kSttChunkMaxCount = 16; // ~32s max hold-to-talk capture
 static constexpr size_t kRecordChunk = 512;
-static constexpr size_t kMicWarmupMs = 60;
-static constexpr size_t kReleaseTailMs = 450;
+static constexpr size_t kMicWarmupMs = 5;
+static constexpr size_t kPreRollMs = 150;
+static constexpr size_t kPreRollSamples = (kSampleRate * kPreRollMs) / 1000;
+static constexpr size_t kReleaseTailMs = 50;
+static constexpr size_t kTurnCaptureMaxMs = 58000;
+static constexpr size_t kCaptureFileReserveBytes = 12288;
+static constexpr size_t kTurnUploadSoftMaxBytes = 1850000;
 // Mic front-end tuning for better STT clarity on natural speech/accents.
-static constexpr int kMicMagnification = 30;
-static constexpr int kMicNoiseFilterLevel = 1;
+static constexpr int kMicMagnification = 24;
+static constexpr int kMicNoiseFilterLevel = 2;
 // Speaker tuning to reduce hiss/static on tiny speaker hats.
 static constexpr int kSpeakerVolume = 185;
 static constexpr bool kVoiceDebug = false;
@@ -52,9 +55,6 @@ static unsigned long g_last_wifi_log_ms = 0;
 static String g_status = "Booting...";
 static String g_detail = "";
 static String g_reply = "";
-static int16_t* g_pcm = nullptr;
-static uint8_t* g_stt_multipart_buf = nullptr;
-static size_t g_stt_multipart_buf_cap = 0;
 static size_t g_last_capture_samples = 0;
 static int g_last_peak = 0;
 static int g_last_avg_abs = 0;
@@ -84,6 +84,7 @@ static unsigned long g_btnb_down_ms = 0;
 static bool g_btnb_long_handled = false;
 static String g_serial_cmd_buf = "";
 static bool g_fs_ready = false;
+static int16_t g_preroll_buf[kPreRollSamples];
 static uint32_t g_voice_turn_seq = 0;
 static uint32_t g_voice_turn_active = 0;
 static ReactionKind g_reaction = ReactionKind::None;
@@ -119,14 +120,6 @@ static bool requestTtsWav(const String& text, uint8_t*& wav_out, size_t& wav_len
 static bool playWavBuffer(uint8_t* wav, size_t wav_len, String& err);
 static bool ensureWifiConnected(String& err);
 static bool speakReplyInChunks(const String& text, String& err);
-static bool transcribeAudioSamples(
-    size_t src_offset_samples,
-    size_t sample_count,
-    const String& stt_prompt,
-    String& text,
-    String& err,
-    size_t& used_samples_out);
-static bool captureTranscriptChunked(String& transcript, String& err);
 static bool requestVoiceTurnText(
     const String& transcript_in,
     uint8_t*& wav_out,
@@ -135,7 +128,13 @@ static bool requestVoiceTurnText(
     String& reply,
     String& screen_action,
     String& err);
-static void mergeTranscriptPart(String& transcript, const String& part);
+static bool requestVoiceTurnAudio(
+    uint8_t*& wav_out,
+    size_t& wav_len,
+    String& transcript,
+    String& reply,
+    String& screen_action,
+    String& err);
 static bool runInjectedTranscriptTurn(const String& transcript_in, String& err);
 static void handleSerialDebugInput();
 
@@ -203,48 +202,6 @@ static void logVoiceJson(const String& evt, const String& fields_json = "") {
   }
   line += "}";
   Serial.println(String("[VOICE JSON] ") + line);
-}
-
-static void mergeTranscriptPart(String& transcript, const String& part_in) {
-  String part = part_in;
-  part.trim();
-  if (part.length() == 0) return;
-  if (transcript.length() == 0) {
-    transcript = part;
-    return;
-  }
-
-  // Avoid appending only exact duplicate tails; keep conservative to prevent
-  // dropping valid continuation text on long questions.
-  if (transcript.endsWith(part)) return;
-
-  int overlap = 0;
-  const int max_check = (transcript.length() < part.length()) ? transcript.length() : part.length();
-  const int cap = (max_check > 36) ? 36 : max_check;
-  for (int n = cap; n >= 14; --n) {
-    const String tail = transcript.substring(transcript.length() - n);
-    const String head = part.substring(0, n);
-    if (tail == head) {
-      // Prefer overlaps that end/start on word boundaries to avoid accidental
-      // matches such as "ing th" across different words.
-      const bool left_word_ok =
-          (transcript.length() == static_cast<size_t>(n)) ||
-          isspace(static_cast<unsigned char>(transcript[transcript.length() - n - 1]));
-      const bool right_word_ok =
-          (part.length() == static_cast<size_t>(n)) ||
-          isspace(static_cast<unsigned char>(part[n]));
-      if (!left_word_ok && !right_word_ok) continue;
-      overlap = n;
-      break;
-    }
-  }
-  if (overlap > 0) {
-    transcript += part.substring(overlap);
-  } else {
-    transcript += " ";
-    transcript += part;
-  }
-  transcript.trim();
 }
 
 static const char* stateLabel(FaceState state) {
@@ -688,7 +645,7 @@ static bool ensureWifiConnected(String& err) {
   return true;
 }
 
-static bool syncTime() { return cloudSyncTime(logLine); }
+static bool syncTime() { return cloudSyncTime(logLine, API_BASE_URL); }
 
 static bool readFully(
     WiFiClient& stream,
@@ -747,38 +704,324 @@ static bool readUnknownLength(
   return out_read > 0;
 }
 
-static bool readFileFully(File& f, uint8_t* out, size_t expected, size_t& out_read) {
-  out_read = 0;
-  while (out_read < expected) {
-    const size_t got = f.read(out + out_read, expected - out_read);
+class MultipartUploadStream : public Stream {
+ public:
+  MultipartUploadStream(const uint8_t* prefix, size_t prefix_len, File* file, const uint8_t* suffix, size_t suffix_len)
+      : prefix_(prefix), prefix_len_(prefix_len), file_(file), suffix_(suffix), suffix_len_(suffix_len) {}
+
+  int available() override {
+    const size_t rem = remaining();
+    return rem > static_cast<size_t>(0x7fffffff) ? 0x7fffffff : static_cast<int>(rem);
+  }
+
+  int read() override {
+    uint8_t c = 0;
+    const size_t n = readBytes(&c, 1);
+    if (n == 1) return static_cast<int>(c);
+    return -1;
+  }
+
+  int peek() override { return -1; }
+
+  void flush() override {}
+
+  size_t write(uint8_t) override { return 0; }
+
+  size_t write(const uint8_t*, size_t) override { return 0; }
+
+  size_t readBytes(uint8_t* buffer, size_t length) override {
+    if (!buffer || length == 0) return 0;
+    size_t out = 0;
+    while (out < length) {
+      if (prefix_pos_ < prefix_len_) {
+        const size_t n = min(length - out, prefix_len_ - prefix_pos_);
+        memcpy(buffer + out, prefix_ + prefix_pos_, n);
+        prefix_pos_ += n;
+        out += n;
+        continue;
+      }
+      if (file_ && file_pos_ < file_len_) {
+        if (file_->position() != static_cast<uint32_t>(file_pos_)) {
+          file_->seek(file_pos_, SeekSet);
+        }
+        const size_t n = min(length - out, file_len_ - file_pos_);
+        const size_t got = file_->read(buffer + out, n);
+        if (got == 0) break;
+        file_pos_ += got;
+        out += got;
+        continue;
+      }
+      if (suffix_pos_ < suffix_len_) {
+        const size_t n = min(length - out, suffix_len_ - suffix_pos_);
+        memcpy(buffer + out, suffix_ + suffix_pos_, n);
+        suffix_pos_ += n;
+        out += n;
+        continue;
+      }
+      break;
+    }
+    return out;
+  }
+
+  void begin() {
+    prefix_pos_ = 0;
+    suffix_pos_ = 0;
+    file_pos_ = 0;
+    file_len_ = file_ ? file_->size() : 0;
+    if (file_) file_->seek(0, SeekSet);
+  }
+
+  size_t totalLength() const { return prefix_len_ + file_len_ + suffix_len_; }
+
+ private:
+  size_t remaining() const {
+    return (prefix_len_ - prefix_pos_) + (file_len_ - file_pos_) + (suffix_len_ - suffix_pos_);
+  }
+
+  const uint8_t* prefix_ = nullptr;
+  size_t prefix_len_ = 0;
+  size_t prefix_pos_ = 0;
+  File* file_ = nullptr;
+  size_t file_len_ = 0;
+  size_t file_pos_ = 0;
+  const uint8_t* suffix_ = nullptr;
+  size_t suffix_len_ = 0;
+  size_t suffix_pos_ = 0;
+};
+
+static bool rewriteWavHeader(File& wav_file, size_t wav_data_bytes) {
+  uint8_t hdr[44];
+  writeWavHeader(hdr, wav_data_bytes, kSampleRate);
+  if (!wav_file.seek(0, SeekSet)) return false;
+  return wav_file.write(hdr, sizeof(hdr)) == sizeof(hdr);
+}
+
+static bool captureTurnWavToFile(const String& wav_path, size_t& total_samples, String& err) {
+  total_samples = 0;
+  g_last_peak = 0;
+  g_last_avg_abs = 0;
+
+  if (!M5.Mic.isEnabled()) startMicIfNeeded();
+  if (!M5.Mic.isEnabled()) {
+    err = "Mic not enabled";
+    return false;
+  }
+  if (!g_fs_ready) {
+    err = "FS unavailable";
+    return false;
+  }
+
+  const size_t fs_total = SPIFFS.totalBytes();
+  const size_t fs_used = SPIFFS.usedBytes();
+  const size_t fs_free = (fs_total > fs_used) ? (fs_total - fs_used) : 0;
+  size_t free_for_audio = (fs_free > (44 + kCaptureFileReserveBytes)) ? (fs_free - 44 - kCaptureFileReserveBytes) : 0;
+  size_t max_samples_by_fs = free_for_audio / sizeof(int16_t);
+  const size_t max_samples_by_time = (kSampleRate * kTurnCaptureMaxMs) / 1000;
+  // Keep multipart upload under worker request-body limits with room for form fields/boundaries.
+  const size_t max_samples_by_upload = ((kTurnUploadSoftMaxBytes > 4096) ? (kTurnUploadSoftMaxBytes - 4096) : 0) / sizeof(int16_t);
+  size_t max_samples = min(max_samples_by_fs, min(max_samples_by_time, max_samples_by_upload));
+  if (max_samples < kMinTurnCaptureSamples) max_samples = kMinTurnCaptureSamples;
+
+  logVoice(String("capture_full fs_total=") + String(fs_total) +
+           " fs_used=" + String(fs_used) +
+           " fs_free=" + String(fs_free) +
+           " max_samples=" + String(max_samples));
+  logVoiceJson(
+      "capture_full_start",
+      String("\"fs_total\":") + String(fs_total) +
+          ",\"fs_used\":" + String(fs_used) +
+          ",\"fs_free\":" + String(fs_free) +
+          ",\"max_samples\":" + String(max_samples) +
+          ",\"upload_soft_max\":" + String(kTurnUploadSoftMaxBytes));
+
+  if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+  File wav_file = SPIFFS.open(wav_path, FILE_WRITE);
+  if (!wav_file) {
+    err = "WAV open failed";
+    return false;
+  }
+  uint8_t empty_hdr[44] = {0};
+  if (wav_file.write(empty_hdr, sizeof(empty_hdr)) != sizeof(empty_hdr)) {
+    wav_file.close();
+    if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+    err = "WAV header write failed";
+    return false;
+  }
+
+  uint64_t sum_abs = 0;
+  int peak = 0;
+  {
+    // Capture a short pre-roll and prepend it so first words are less likely
+    // to be clipped when users begin speaking right on button press.
+    const size_t warmup_samples = (kSampleRate * kMicWarmupMs) / 1000;
+    int16_t trash[160];
+    size_t warm_left = warmup_samples;
+    while (warm_left > 0) {
+      const size_t chunk = (warm_left > 160) ? 160 : warm_left;
+      M5.Mic.record(trash, chunk, kSampleRate);
+      warm_left -= chunk;
+    }
+
+    size_t got_preroll = 0;
+    while (got_preroll < kPreRollSamples) {
+      size_t chunk = kPreRollSamples - got_preroll;
+      if (chunk > kRecordChunk) chunk = kRecordChunk;
+      if (M5.Mic.record(g_preroll_buf + got_preroll, chunk, kSampleRate)) {
+        got_preroll += chunk;
+      }
+      M5.update();
+      if (M5.BtnB.wasPressed()) {
+        wav_file.close();
+        if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+        err = "Cancelled";
+        return false;
+      }
+    }
+    if (got_preroll > 0) {
+      const size_t wrote = wav_file.write(
+          reinterpret_cast<const uint8_t*>(g_preroll_buf),
+          got_preroll * sizeof(int16_t));
+      if (wrote != got_preroll * sizeof(int16_t)) {
+        wav_file.close();
+        if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+        err = "WAV pre-roll write failed";
+        return false;
+      }
+      for (size_t i = 0; i < got_preroll; ++i) {
+        int v = g_preroll_buf[i];
+        if (v < 0) v = -v;
+        sum_abs += static_cast<uint32_t>(v);
+        if (v > peak) peak = v;
+      }
+      total_samples += got_preroll;
+    }
+  }
+
+  int16_t buf[kRecordChunk];
+  bool still_holding = true;
+  bool release_started = false;
+  unsigned long release_start_ms = 0;
+  int last_tick_ui = -1;
+  while (still_holding && total_samples < max_samples) {
+    size_t want = kRecordChunk;
+    if (want > (max_samples - total_samples)) want = (max_samples - total_samples);
+    if (want == 0) break;
+    if (M5.Mic.record(buf, want, kSampleRate)) {
+      const size_t wrote = wav_file.write(reinterpret_cast<const uint8_t*>(buf), want * sizeof(int16_t));
+      if (wrote != want * sizeof(int16_t)) {
+        logLine("[STT] wav capture write short, stopping early");
+        still_holding = false;
+      }
+      for (size_t i = 0; i < want; ++i) {
+        int v = buf[i];
+        if (v < 0) v = -v;
+        sum_abs += static_cast<uint32_t>(v);
+        if (v > peak) peak = v;
+      }
+      total_samples += want;
+    }
+
+    M5.update();
+    if (M5.BtnB.wasPressed()) {
+      wav_file.close();
+      if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+      err = "Cancelled";
+      return false;
+    }
+    const bool a_pressed = M5.BtnA.isPressed();
+    if (!a_pressed && total_samples >= kSttChunkMinSamples) {
+      if (!release_started) {
+        release_started = true;
+        release_start_ms = millis();
+      } else if (millis() - release_start_ms >= kReleaseTailMs &&
+                 total_samples >= kMinTurnCaptureSamples) {
+        still_holding = false;
+      }
+    } else if (a_pressed) {
+      release_started = false;
+    }
+    const int ticks = static_cast<int>(total_samples / (kSampleRate / 10));
+    if (last_tick_ui < 0 || ticks >= last_tick_ui + 5) {
+      setUi(FaceState::Recording, "Listening...", String(ticks) + " ticks");
+      last_tick_ui = ticks;
+    }
+  }
+
+  g_last_capture_samples = total_samples;
+  g_last_peak = peak;
+  g_last_avg_abs = (total_samples > 0) ? static_cast<int>(sum_abs / total_samples) : 0;
+
+  const size_t wav_data_bytes = total_samples * sizeof(int16_t);
+  const bool hdr_ok = rewriteWavHeader(wav_file, wav_data_bytes);
+  wav_file.close();
+  if (!hdr_ok) {
+    if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+    err = "WAV header finalize failed";
+    return false;
+  }
+
+  if (total_samples < kSttChunkMinSamples) {
+    if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+    err = "Too short";
+    return false;
+  }
+  return true;
+}
+
+static bool sha256Multipart(const String& prefix, File& wav_file, const String& suffix, String& out_hex, String& err) {
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  if (mbedtls_sha256_starts_ret(&ctx, 0) != 0) {
+    mbedtls_sha256_free(&ctx);
+    err = "SHA256 init failed";
+    return false;
+  }
+
+  if (prefix.length() > 0 &&
+      mbedtls_sha256_update_ret(&ctx, reinterpret_cast<const uint8_t*>(prefix.c_str()), prefix.length()) != 0) {
+    mbedtls_sha256_free(&ctx);
+    err = "SHA256 prefix failed";
+    return false;
+  }
+
+  if (!wav_file.seek(0, SeekSet)) {
+    mbedtls_sha256_free(&ctx);
+    err = "WAV seek failed";
+    return false;
+  }
+  uint8_t buf[2048];
+  while (true) {
+    const size_t got = wav_file.read(buf, sizeof(buf));
     if (got == 0) break;
-    out_read += got;
+    if (mbedtls_sha256_update_ret(&ctx, buf, got) != 0) {
+      mbedtls_sha256_free(&ctx);
+      err = "SHA256 wav failed";
+      return false;
+    }
   }
-  return out_read == expected;
-}
 
-static bool writeFileFully(File& f, const uint8_t* data, size_t expected, size_t& out_written) {
-  out_written = 0;
-  while (out_written < expected) {
-    size_t step = expected - out_written;
-    if (step > 2048) step = 2048;
-    const size_t put = f.write(data + out_written, step);
-    if (put == 0) break;
-    out_written += put;
+  if (suffix.length() > 0 &&
+      mbedtls_sha256_update_ret(&ctx, reinterpret_cast<const uint8_t*>(suffix.c_str()), suffix.length()) != 0) {
+    mbedtls_sha256_free(&ctx);
+    err = "SHA256 suffix failed";
+    return false;
   }
-  return out_written == expected;
-}
 
-static bool ensureSttMultipartCapacity(size_t need_bytes) {
-  if (g_stt_multipart_buf && g_stt_multipart_buf_cap >= need_bytes) return true;
-  if (g_stt_multipart_buf) {
-    free(g_stt_multipart_buf);
-    g_stt_multipart_buf = nullptr;
-    g_stt_multipart_buf_cap = 0;
+  uint8_t digest[32];
+  if (mbedtls_sha256_finish_ret(&ctx, digest) != 0) {
+    mbedtls_sha256_free(&ctx);
+    err = "SHA256 finish failed";
+    return false;
   }
-  g_stt_multipart_buf = static_cast<uint8_t*>(malloc(need_bytes));
-  if (!g_stt_multipart_buf) return false;
-  g_stt_multipart_buf_cap = need_bytes;
+  mbedtls_sha256_free(&ctx);
+
+  static const char* hex = "0123456789abcdef";
+  out_hex = "";
+  out_hex.reserve(64);
+  for (size_t i = 0; i < sizeof(digest); ++i) {
+    out_hex += hex[(digest[i] >> 4) & 0x0F];
+    out_hex += hex[digest[i] & 0x0F];
+  }
   return true;
 }
 
@@ -930,446 +1173,6 @@ static bool signedPost(
 
 static bool isNoSpeechError(const String& err) {
   return err.indexOf("No speech recognized") >= 0;
-}
-
-static bool transcribeAudioSamples(
-    size_t src_offset_samples,
-    size_t sample_count,
-    const String& stt_prompt,
-    String& text,
-    String& err,
-    size_t& used_samples_out) {
-  used_samples_out = 0;
-  const size_t base = (sample_count > 0) ? sample_count : kRecordSamplesMin;
-  const size_t sample_opts[] = {
-      base,
-      (base * 90) / 100,
-      (base * 80) / 100,
-      (base * 70) / 100,
-      (base * 60) / 100,
-      (base * 50) / 100,
-      (base * 40) / 100,
-      (base * 30) / 100,
-      (base * 25) / 100,
-      (base * 20) / 100,
-      (base * 15) / 100,
-  };
-  uint8_t* body = nullptr;
-  size_t body_len = 0;
-  size_t used_samples = 0;
-  size_t built_len = 0;
-  for (size_t i = 0; i < (sizeof(sample_opts) / sizeof(sample_opts[0])); ++i) {
-    const size_t s = sample_opts[i];
-    if (s < (kSttChunkMinSamples / 3)) continue;
-    const size_t wav_data_bytes = s * sizeof(int16_t);
-    const size_t try_body_len = 44 + wav_data_bytes;
-    if (!ensureSttMultipartCapacity(try_body_len)) continue;
-
-    size_t idx = 0;
-    writeWavHeader(g_stt_multipart_buf + idx, wav_data_bytes, kSampleRate);
-    idx += 44;
-    // Preserve current segment start when fallback reduces samples.
-    memcpy(g_stt_multipart_buf + idx, reinterpret_cast<uint8_t*>(g_pcm + src_offset_samples), wav_data_bytes);
-    idx += wav_data_bytes;
-    body = g_stt_multipart_buf;
-    body_len = try_body_len;
-    used_samples = s;
-    built_len = idx;
-    break;
-  }
-  if (!body) {
-    err = "OOM multipart";
-    return false;
-  }
-  used_samples_out = used_samples;
-  if (built_len != body_len) {
-    err = "Multipart build mismatch";
-    return false;
-  }
-  if (used_samples < base) {
-    logLine(String("[STT] multipart fallback samples=") + String(used_samples) + "/" + String(base));
-  }
-
-  auto parseText = [&](const String& raw, String& out_text, String& out_err) -> bool {
-    JsonDocument doc;
-    const auto jerr = deserializeJson(doc, raw);
-    if (jerr) {
-      out_err = String("STT json ") + jerr.c_str();
-      return false;
-    }
-    out_text = doc["text"] | "";
-    return true;
-  };
-
-  auto sttCall = [&](String& out_text, String& out_err) -> bool {
-    String payload;
-    int code = 0;
-    String http_err;
-    String stt_path = "/v1/stt-raw";
-    if (stt_prompt.length() > 0) {
-      String hint = stt_prompt;
-      hint.trim();
-      if (hint.length() > 160) hint = hint.substring(hint.length() - 160);
-      stt_path += "?prompt=";
-      stt_path += urlEncode(hint);
-    }
-    const bool ok = signedPost(stt_path, "audio/wav", body, body_len, payload, code, http_err);
-    if (!ok) {
-      out_err = http_err;
-      return false;
-    }
-    if (code != 200) {
-      out_err = "STT HTTP " + String(code) + " " + truncateForScreen(payload, 60);
-      return false;
-    }
-    return parseText(payload, out_text, out_err);
-  };
-
-  String first_text;
-  if (!sttCall(first_text, err)) return false;
-  text = first_text;
-  text.trim();
-
-  auto hasEllipsis = [](const String& s) -> bool {
-    return s.indexOf("...") >= 0 || s.indexOf("…") >= 0;
-  };
-
-  // If STT emits ellipsis/truncation markers, retry once on the same audio and
-  // keep the stronger result (prefer non-ellipsis and longer text).
-  if (text.length() > 0 && hasEllipsis(text)) {
-    String retry_text;
-    String retry_err;
-    if (sttCall(retry_text, retry_err)) {
-      retry_text.trim();
-      const bool base_has_ellipsis = hasEllipsis(text);
-      const bool retry_has_ellipsis = hasEllipsis(retry_text);
-      if (retry_text.length() > 0 &&
-          ((base_has_ellipsis && !retry_has_ellipsis) ||
-           (retry_text.length() > text.length() + 2))) {
-        logLine(String("[STT] retry improved: \"") + text + "\" -> \"" + retry_text + "\"");
-        text = retry_text;
-      }
-    }
-  }
-  return true;
-}
-
-static bool captureTranscriptChunked(String& transcript, String& err) {
-  transcript = "";
-  if (!g_pcm) {
-    g_pcm = static_cast<int16_t*>(malloc(kSttChunkSamples * sizeof(int16_t)));
-    if (!g_pcm) {
-      err = "OOM pcm buffer";
-      return false;
-    }
-  }
-  if (!M5.Mic.isEnabled()) startMicIfNeeded();
-  if (!M5.Mic.isEnabled()) {
-    err = "Mic not enabled";
-    return false;
-  }
-  if (!g_fs_ready) {
-    err = "FS unavailable";
-    return false;
-  }
-
-  auto blockPath = [](int idx) -> String {
-    char p[20];
-    snprintf(p, sizeof(p), "/stt_%02d.bin", idx);
-    return String(p);
-  };
-  // Store captured audio as 16-bit PCM for STT fidelity (better long-question accuracy).
-  const size_t bytes_per_block = kSttChunkSamples * sizeof(int16_t);
-  const size_t fs_total = SPIFFS.totalBytes();
-  const size_t fs_used = SPIFFS.usedBytes();
-  const size_t fs_free = (fs_total > fs_used) ? (fs_total - fs_used) : 0;
-  int fs_chunk_limit = static_cast<int>(fs_free / bytes_per_block);
-  if (fs_chunk_limit < 1) fs_chunk_limit = 1;
-  if (fs_chunk_limit > kSttChunkMaxCount) fs_chunk_limit = kSttChunkMaxCount;
-  logVoice(String("capture fs_total=") + String(fs_total) +
-           " fs_used=" + String(fs_used) +
-           " fs_free=" + String(fs_free) +
-           " chunk_samples=" + String(kSttChunkSamples) +
-           " chunk_limit=" + String(fs_chunk_limit));
-  logVoiceJson(
-      "capture_start",
-      String("\"fs_total\":") + String(fs_total) +
-          ",\"fs_used\":" + String(fs_used) +
-          ",\"fs_free\":" + String(fs_free) +
-          ",\"chunk_samples\":" + String(kSttChunkSamples) +
-          ",\"chunk_limit\":" + String(fs_chunk_limit));
-
-  // Warmup once at the beginning of hold-to-talk capture.
-  {
-    const size_t warmup_samples = (kSampleRate * kMicWarmupMs) / 1000;
-    int16_t trash[160];
-    size_t left = warmup_samples;
-    while (left > 0) {
-      const size_t chunk = (left > 160) ? 160 : left;
-      M5.Mic.record(trash, chunk, kSampleRate);
-      left -= chunk;
-    }
-  }
-
-  size_t total_samples = 0;
-  uint16_t block_samples_list[kSttChunkMaxCount];
-  uint8_t block_file_idx[kSttChunkMaxCount];
-  int block_count = 0;
-  int chunk_index = 0;
-  bool still_holding = true;
-  while (still_holding && chunk_index < fs_chunk_limit) {
-    if (!g_pcm) {
-      g_pcm = static_cast<int16_t*>(malloc(kSttChunkSamples * sizeof(int16_t)));
-      if (!g_pcm) {
-        err = "OOM pcm buffer";
-        return false;
-      }
-    }
-    size_t offset = 0;
-    uint64_t sum_abs = 0;
-    int peak = 0;
-    const unsigned long chunk_start = millis();
-    bool release_started = false;
-    unsigned long release_start_ms = 0;
-
-    while (offset < kSttChunkSamples) {
-      const size_t chunk =
-          (kSttChunkSamples - offset > kRecordChunk) ? kRecordChunk : (kSttChunkSamples - offset);
-      if (M5.Mic.record(&g_pcm[offset], chunk, kSampleRate)) {
-        for (size_t i = 0; i < chunk; ++i) {
-          int v = g_pcm[offset + i];
-          if (v < 0) v = -v;
-          sum_abs += static_cast<uint32_t>(v);
-          if (v > peak) peak = v;
-        }
-        offset += chunk;
-      }
-      M5.update();
-      if (M5.BtnB.wasPressed()) {
-        err = "Cancelled";
-        return false;
-      }
-      const bool a_pressed = M5.BtnA.isPressed();
-      if (!a_pressed && offset >= kSttChunkMinSamples) {
-        if (!release_started) {
-          release_started = true;
-          release_start_ms = millis();
-        } else if (millis() - release_start_ms >= kReleaseTailMs &&
-                   (total_samples + offset) >= kMinTurnCaptureSamples) {
-          still_holding = false;
-          break;
-        }
-      } else if (a_pressed) {
-        release_started = false;
-      }
-      if (millis() - chunk_start > 3000) break;
-    }
-
-    if (offset < kSttChunkMinSamples) {
-      if (transcript.length() > 0) break;
-      err = "Too short";
-      return false;
-    }
-
-    int avg_after = static_cast<int>(sum_abs / offset);
-    int peak_after = peak;
-    processMicPcmInPlace(g_pcm, offset, avg_after, peak_after);
-    g_last_peak = peak_after;
-    g_last_avg_abs = avg_after;
-    total_samples += offset;
-    const uint16_t block_samples = static_cast<uint16_t>(offset);
-    size_t wrote = 0;
-    const String p = blockPath(chunk_index);
-    File block_file = SPIFFS.open(p, FILE_WRITE);
-    if (block_file) {
-      const size_t want_bytes = static_cast<size_t>(block_samples) * sizeof(int16_t);
-      writeFileFully(
-          block_file,
-          reinterpret_cast<const uint8_t*>(g_pcm),
-          want_bytes,
-          wrote);
-      if (wrote != want_bytes) {
-        // Retry once after reopening; helps recover from transient SPIFFS write stalls.
-        block_file.close();
-        delay(2);
-        block_file = SPIFFS.open(p, FILE_WRITE);
-        if (block_file) {
-          wrote = 0;
-          writeFileFully(
-              block_file,
-              reinterpret_cast<const uint8_t*>(g_pcm),
-              want_bytes,
-              wrote);
-        }
-      }
-      block_file.close();
-    } else {
-      logLine(String("[STT] cache open failed: ") + p);
-    }
-    if (wrote >= (static_cast<size_t>(kSttChunkMinSamples / 3) * sizeof(int16_t))) {
-      if (block_count < kSttChunkMaxCount) {
-        block_samples_list[block_count++] = block_samples;
-        block_file_idx[block_count - 1] = static_cast<uint8_t>(chunk_index);
-      }
-    }
-    logVoice(String("capture block#") + String(chunk_index + 1) +
-             " samples=" + String(block_samples) +
-             " wrote_bytes=" + String(wrote) +
-             " total_samples=" + String(total_samples));
-    logVoiceJson(
-        "capture_block",
-        String("\"idx\":") + String(chunk_index + 1) +
-            ",\"samples\":" + String(block_samples) +
-            ",\"wrote_bytes\":" + String(wrote) +
-            ",\"total_samples\":" + String(total_samples));
-    if (wrote != static_cast<size_t>(block_samples) * sizeof(int16_t)) {
-      logLine("[STT] cache full, stopping capture early");
-      still_holding = false;
-      break;
-    }
-    setUi(FaceState::Recording, "Listening...", String(total_samples / (kSampleRate / 10)) + " ticks");
-    ++chunk_index;
-  }
-  g_last_capture_samples = total_samples;
-  if (total_samples < kSttChunkMinSamples) {
-    for (int i = 0; i < block_count; ++i) {
-      const String p = blockPath(block_file_idx[i]);
-      if (SPIFFS.exists(p)) SPIFFS.remove(p);
-    }
-    err = "Too short";
-    return false;
-  }
-  setUi(FaceState::Thinking, "Transcribing...", "");
-  logVoice(String("transcribe blocks=") + String(block_count) +
-           " total_samples=" + String(total_samples));
-  logVoiceJson(
-      "transcribe_start",
-      String("\"blocks\":") + String(block_count) +
-          ",\"total_samples\":" + String(total_samples));
-
-  for (int bi = 0; bi < block_count; ++bi) {
-    uint16_t block_samples = block_samples_list[bi];
-    if (block_samples == 0 || block_samples > kSttChunkSamples) continue;
-    const String p = blockPath(block_file_idx[bi]);
-    File in = SPIFFS.open(p, FILE_READ);
-    if (!in) {
-      err = "STT block open failed";
-      return false;
-    }
-    logVoice(String("stt block#") + String(bi + 1) + "/" + String(block_count) +
-             " block_samples=" + String(block_samples));
-    logVoiceJson(
-        "stt_block_start",
-        String("\"idx\":") + String(bi + 1) +
-            ",\"count\":" + String(block_count) +
-            ",\"samples\":" + String(block_samples));
-    if (!g_pcm) {
-      g_pcm = static_cast<int16_t*>(malloc(kSttChunkSamples * sizeof(int16_t)));
-      if (!g_pcm) {
-        in.close();
-        if (SPIFFS.exists(p)) SPIFFS.remove(p);
-        err = "OOM pcm buffer";
-        return false;
-      }
-    }
-    const size_t want_bytes = static_cast<size_t>(block_samples) * sizeof(int16_t);
-    size_t got_bytes = 0;
-    if (!readFileFully(in, reinterpret_cast<uint8_t*>(g_pcm), want_bytes, got_bytes)) {
-      const uint16_t got_samples = static_cast<uint16_t>(got_bytes / sizeof(int16_t));
-      if (got_samples >= (kSttChunkMinSamples / 2)) {
-        logLine(String("[STT] cache short read using partial ") + String(got_bytes) + "/" + String(want_bytes));
-        block_samples = got_samples;
-      } else if (transcript.length() > 0) {
-        logLine(String("[STT] cache short read tail ") + String(got_bytes) + "/" + String(want_bytes));
-        break;
-      } else {
-        in.close();
-        if (SPIFFS.exists(p)) SPIFFS.remove(p);
-        err = String("STT cache short read ") + String(got_bytes) + "/" + String(want_bytes);
-        return false;
-      }
-    }
-    in.close();
-    if (SPIFFS.exists(p)) SPIFFS.remove(p);
-
-    size_t consumed = 0;
-    int stt_seg = 0;
-    while (consumed < block_samples) {
-      size_t request_samples = block_samples - consumed;
-      String part;
-      String stt_prompt = "Continue transcript exactly. ";
-      if (transcript.length() > 0) {
-        String tail = transcript;
-        if (tail.length() > 80) tail = tail.substring(tail.length() - 80);
-        stt_prompt += "Previous context: ";
-        stt_prompt += tail;
-      } else {
-        stt_prompt += "Start of utterance.";
-      }
-      String stt_err;
-      size_t used_samples = 0;
-      bool ok_seg = false;
-      while (request_samples >= (kSttChunkMinSamples / 3)) {
-        if (transcribeAudioSamples(consumed, request_samples, stt_prompt, part, stt_err, used_samples)) {
-          ok_seg = true;
-          break;
-        }
-        if (stt_err.indexOf("OOM multipart") < 0) break;
-        request_samples /= 2;
-        if (request_samples < (kSttChunkMinSamples / 3)) break;
-        logLine(String("[STT] oom retry with samples=") + String(request_samples));
-      }
-      if (!ok_seg) {
-        if (!isNoSpeechError(stt_err)) {
-          if (SPIFFS.exists(p)) SPIFFS.remove(p);
-          err = stt_err;
-          return false;
-        }
-        logVoice(String("stt block#") + String(bi + 1) + " seg#" + String(stt_seg + 1) + " no-speech");
-        logVoiceJson(
-            "stt_block_no_speech",
-            String("\"idx\":") + String(bi + 1) +
-                ",\"seg\":" + String(stt_seg + 1));
-      } else {
-        part.trim();
-        logVoice(String("stt block#") + String(bi + 1) + " seg#" + String(stt_seg + 1) +
-                 " used=" + String(used_samples) + " text=\"" + part + "\"");
-        logVoiceJson(
-            "stt_block_text",
-            String("\"idx\":") + String(bi + 1) +
-                ",\"seg\":" + String(stt_seg + 1) +
-                ",\"used\":" + String(used_samples) +
-                ",\"text\":\"" + jsonEscape(part) + "\"");
-        if (part.length() > 0) {
-          mergeTranscriptPart(transcript, part);
-          logVoice(String("stt merged len=") + String(transcript.length()) +
-                   " transcript=\"" + transcript + "\"");
-          logVoiceJson(
-              "stt_merged",
-              String("\"len\":") + String(transcript.length()) +
-                  ",\"text\":\"" + jsonEscape(transcript) + "\"");
-        }
-      }
-      if (used_samples == 0) {
-        // Avoid infinite loop on unexpected upstream behavior.
-        break;
-      }
-      consumed += used_samples;
-      ++stt_seg;
-    }
-  }
-  transcript.trim();
-  if (transcript.length() == 0) {
-    err = "No speech recognized";
-    return false;
-  }
-  logLine(String("[STT CHUNKED] ") + transcript);
-  logVoice(String("stt final len=") + String(transcript.length()));
-  logVoiceJson(
-      "stt_final",
-      String("\"len\":") + String(transcript.length()) +
-          ",\"text\":\"" + jsonEscape(transcript) + "\"");
-  return true;
 }
 
 static bool sendChatRequest(const String& user_text, String& reply, String& err) {
@@ -1752,6 +1555,198 @@ static bool speakReplyInChunks(const String& text, String& err) {
   return true;
 }
 
+static bool requestVoiceTurnAudio(
+    uint8_t*& wav_out,
+    size_t& wav_len,
+    String& transcript,
+    String& reply,
+    String& screen_action,
+    String& err) {
+  wav_out = nullptr;
+  wav_len = 0;
+  transcript = "";
+  reply = "";
+  screen_action = "";
+
+  const String wav_path = "/turn_capture.wav";
+  size_t captured_samples = 0;
+  if (!captureTurnWavToFile(wav_path, captured_samples, err)) return false;
+
+  setUi(FaceState::Thinking, "Cloud turn...", "STT+Chat+TTS");
+  const String sensor_context = buildSensorContextJson();
+
+  File wav_file = SPIFFS.open(wav_path, FILE_READ);
+  if (!wav_file) {
+    if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+    err = "WAV open failed";
+    return false;
+  }
+
+  auto cleanup = [&]() {
+    wav_file.close();
+    if (SPIFFS.exists(wav_path)) SPIFFS.remove(wav_path);
+  };
+
+  const String boundary = "----m5turn" + nonceHex();
+  const String prefix =
+      String("--") + boundary + "\r\n" +
+      "Content-Disposition: form-data; name=\"context\"\r\n\r\n" +
+      sensor_context + "\r\n" +
+      "--" + boundary + "\r\n" +
+      "Content-Disposition: form-data; name=\"audio\"; filename=\"audio.wav\"\r\n" +
+      "Content-Type: audio/wav\r\n\r\n";
+  const String suffix = String("\r\n--") + boundary + "--\r\n";
+  String body_hash;
+  String hash_err;
+  if (!sha256Multipart(prefix, wav_file, suffix, body_hash, hash_err)) {
+    cleanup();
+    err = hash_err;
+    return false;
+  }
+
+  time_t now = time(nullptr);
+  if (now < 1700000000 && !syncTime()) {
+    cleanup();
+    err = "NTP sync failed";
+    return false;
+  }
+  now = time(nullptr);
+
+  const String path = "/v1/voice-turn";
+  const String ts = String(static_cast<long>(now));
+  const String nonce = nonceHex();
+  const String canonical = ts + "." + nonce + ".POST." + path + "." + body_hash;
+  const String signature = hmacSha256Hex(DEVICE_SHARED_SECRET, canonical);
+  const String content_type = String("multipart/form-data; boundary=") + boundary;
+
+  String last_err = "";
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, String(API_BASE_URL) + path)) {
+      last_err = "http begin failed";
+      continue;
+    }
+    http.setConnectTimeout(9000);
+    http.setTimeout(55000);
+    const char* header_keys[] = {
+        "Content-Type",
+        "x-transcript",
+        "x-transcript-original",
+        "x-reply",
+        "x-screen",
+        "x-stt-ms",
+        "x-audio-bytes",
+        "x-stt-model"};
+    http.collectHeaders(header_keys, 8);
+    http.addHeader("Content-Type", content_type);
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-timestamp", ts);
+    http.addHeader("x-nonce", nonce);
+    http.addHeader("x-signature", signature);
+    http.addHeader("x-tts-chunked", "0");
+
+    MultipartUploadStream body_stream(
+        reinterpret_cast<const uint8_t*>(prefix.c_str()),
+        prefix.length(),
+        &wav_file,
+        reinterpret_cast<const uint8_t*>(suffix.c_str()),
+        suffix.length());
+    body_stream.begin();
+    const int code = http.sendRequest("POST", &body_stream, body_stream.totalLength());
+    logLine(String("[HTTP] /v1/voice-turn -> ") + String(code) +
+            " samples=" + String(captured_samples));
+
+    if (code < 0) {
+      last_err = "TURN HTTP " + String(code);
+      http.end();
+      if (attempt == 0) {
+        logLine("[TURN] transient transport error, retrying once...");
+        delay(120);
+        continue;
+      }
+      cleanup();
+      err = last_err;
+      return false;
+    }
+    if (code != 200 && code != 204) {
+      const String payload = http.getString();
+      http.end();
+      cleanup();
+      err = "TURN HTTP " + String(code) + " " + truncateForScreen(payload, 60);
+      return false;
+    }
+
+    transcript = urlDecode(http.header("x-transcript"));
+    const String transcript_original = urlDecode(http.header("x-transcript-original"));
+    reply = urlDecode(http.header("x-reply"));
+    screen_action = http.header("x-screen");
+    const String stt_ms = http.header("x-stt-ms");
+    const String audio_bytes = http.header("x-audio-bytes");
+    const String stt_model = urlDecode(http.header("x-stt-model"));
+    if (stt_ms.length() > 0 || audio_bytes.length() > 0 || stt_model.length() > 0) {
+      logLine(String("[STT DBG] model=") + stt_model +
+              " stt_ms=" + stt_ms +
+              " audio_bytes=" + audio_bytes +
+              " captured_samples=" + String(captured_samples));
+    }
+    if (transcript_original.length() > 0 && transcript_original != transcript) {
+      logLine(String("[STT ORIG] ") + transcript_original);
+      logLine(String("[STT FIXD] ") + transcript);
+    }
+
+    if (code == 204) {
+      http.end();
+      cleanup();
+      return true;
+    }
+
+    const String resp_type = http.header("Content-Type");
+    if (resp_type.indexOf("audio/wav") < 0) {
+      const String payload = http.getString();
+      http.end();
+      cleanup();
+      err = "Unexpected type: " + resp_type + " " + truncateForScreen(payload, 40);
+      return false;
+    }
+
+    const int len = http.getSize();
+    if (len <= 0 || len > 180000) {
+      http.end();
+      cleanup();
+      err = "Turn audio too large";
+      return false;
+    }
+
+    wav_out = static_cast<uint8_t*>(malloc(len));
+    if (!wav_out) {
+      http.end();
+      cleanup();
+      wav_len = 0;
+      return true;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    size_t got = 0;
+    const bool full = readFully(*stream, wav_out, static_cast<size_t>(len), 6000, got);
+    http.end();
+    cleanup();
+    wav_len = got;
+    if (!full || wav_len < 44) {
+      free(wav_out);
+      wav_out = nullptr;
+      wav_len = 0;
+      return true;
+    }
+    return true;
+  }
+
+  cleanup();
+  err = last_err.length() ? last_err : "TURN failed";
+  return false;
+}
+
 static bool requestVoiceTurnText(
     const String& transcript_in,
     uint8_t*& wav_out,
@@ -1852,17 +1847,6 @@ static bool requestVoiceTurnText(
       return false;
     }
 
-    // Release STT buffers before playback allocation to reduce heap fragmentation.
-    if (g_pcm) {
-      free(g_pcm);
-      g_pcm = nullptr;
-    }
-    if (g_stt_multipart_buf) {
-      free(g_stt_multipart_buf);
-      g_stt_multipart_buf = nullptr;
-      g_stt_multipart_buf_cap = 0;
-    }
-
     wav_out = static_cast<uint8_t*>(malloc(len));
     if (!wav_out) {
       logLine(String("[TURN AUDIO] malloc fallback len=") + String(len) +
@@ -1919,8 +1903,8 @@ static VoiceTurnContext makeVoiceTurnContext() {
   ctx.ui_recording_state = static_cast<int>(FaceState::Recording);
   ctx.ui_thinking_state = static_cast<int>(FaceState::Thinking);
   ctx.ui_speaking_state = static_cast<int>(FaceState::Speaking);
-  ctx.captureTranscriptChunked = captureTranscriptChunked;
   ctx.ensureWifiConnected = ensureWifiConnected;
+  ctx.requestVoiceTurnAudio = requestVoiceTurnAudio;
   ctx.requestVoiceTurnText = requestVoiceTurnText;
   ctx.isNoSpeechError = isNoSpeechError;
   ctx.playWavBuffer = playWavBuffer;
@@ -2035,21 +2019,15 @@ void setup() {
   g_fs_ready = SPIFFS.begin(true);
   logLine(String("[FS] SPIFFS ") + (g_fs_ready ? "ready" : "failed"));
 
-  // Keep persistent PCM buffer sized for chunked STT path to preserve TLS headroom.
-  g_pcm = static_cast<int16_t*>(malloc(kSttChunkSamples * sizeof(int16_t)));
-  if (!g_pcm) {
-    setUi(FaceState::Error, "OOM", "pcm buffer");
-    return;
-  }
-
   g_next_blink_at = millis() + 1200;
   g_last_hunger_tick_ms = millis();
   setUi(FaceState::Connecting, "Booting...", "Init");
 
   if (!connectWifi()) return;
   if (!syncTime()) {
-    setUi(FaceState::Error, "NTP failed", "Clock not set");
-    return;
+    // Allow operation even if boot-time NTP fails; signed cloud calls will
+    // retry time sync on demand before request auth.
+    logLine("[NTP] boot sync failed; continuing and will retry on demand");
   }
 
   auto mic_cfg = M5.Mic.config();

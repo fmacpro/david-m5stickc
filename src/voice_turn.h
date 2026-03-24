@@ -16,8 +16,8 @@ struct VoiceTurnContext {
   int ui_thinking_state = 0;
   int ui_speaking_state = 0;
 
-  bool (*captureTranscriptChunked)(String&, String&) = nullptr;
   bool (*ensureWifiConnected)(String&) = nullptr;
+  bool (*requestVoiceTurnAudio)(uint8_t*&, size_t&, String&, String&, String&, String&) = nullptr;
   bool (*requestVoiceTurnText)(const String&, uint8_t*&, size_t&, String&, String&, String&, String&) = nullptr;
   bool (*isNoSpeechError)(const String&) = nullptr;
   bool (*playWavBuffer)(uint8_t*, size_t, String&) = nullptr;

@@ -10,7 +10,7 @@ struct CloudClientConfig {
 
 using CloudLogFn = void (*)(const String&);
 
-bool cloudSyncTime(CloudLogFn log_fn = nullptr);
+bool cloudSyncTime(CloudLogFn log_fn = nullptr, const char* http_time_url = nullptr);
 bool cloudSignedPost(
     const CloudClientConfig& cfg,
     const String& path,

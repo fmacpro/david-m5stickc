@@ -21,15 +21,17 @@ export function isBatteryIntent(lower: string): boolean {
   );
 }
 
-export function isLikelyTimeMisheardAsBattery(lower: string): boolean {
-  if (!lower.includes("battery")) return false;
-  if (lower.includes("battery level")) return false;
-  if (lower.includes("charge") || lower.includes("power level") || lower.includes("%")) return false;
+export function isDrawIntent(lower: string): boolean {
+  const t = lower.trim();
   return (
-    lower.includes("what battery is it") ||
-    lower.includes("tell me the battery") ||
-    lower.includes("current battery is it") ||
-    lower.includes("battery is it")
+    t.includes("draw") ||
+    t.includes("sketch") ||
+    t.includes("doodle") ||
+    t.includes("icon") ||
+    t.includes("shape") ||
+    t.includes("show me a") ||
+    t.includes("show a") ||
+    t.includes("display a")
   );
 }
 

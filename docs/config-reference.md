@@ -48,6 +48,8 @@ Core runtime controls:
 
 - `CHAT_MODEL`: LLM for response generation
 - `TRANSCRIBE_MODEL`: speech-to-text model
+- `TRANSCRIBE_LANGUAGE`: language hint for transcription (default `en`)
+- `TRANSCRIBE_PROMPT`: optional custom transcription prompt for long-utterance behavior
 - `TTS_MODEL`: text-to-speech model
 - `TTS_VOICE`: selected voice
 - `TTS_INSTRUCTIONS`: voice style guidance
@@ -55,6 +57,7 @@ Core runtime controls:
 - `MAX_TEXT_CHARS`: incoming text guardrail
 - `MAX_REPLY_CHARS`: response length cap
 - `REPLY_MAX_TOKENS`: token cap for generated replies
+- `MAX_BODY_BYTES`: max signed request payload accepted by worker (default 2,000,000)
 
 Observability:
 

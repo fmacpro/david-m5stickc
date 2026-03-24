@@ -57,7 +57,20 @@ Fix:
 ## Fast Health Checklist
 
 1. `WiFi connected` on device logs
-2. `/v1/stt-raw` returns 200
-3. `/v1/voice-turn-text` returns 204
+2. `/v1/voice-turn` returns 200/204
+3. Serial shows `[STT DBG] model=... stt_ms=... audio_bytes=...`
 4. `/v1/tts` returns 200
 5. No device OOM / panic during playback
+
+## Long Question STT Tuning
+
+- Prefer worker-side transcription via `/v1/voice-turn` (single WAV upload).
+- Raise `MAX_BODY_BYTES` in worker config if uploads are rejected with `413`.
+- Tune worker vars:
+  - `TRANSCRIBE_MODEL` (quality/cost tradeoff)
+  - `TRANSCRIBE_LANGUAGE` (for example `en`)
+  - `TRANSCRIBE_PROMPT` (emphasize complete long-utterance capture)
+- On device serial, inspect `[STT DBG]` and `[HTTP] /v1/voice-turn` lines to verify:
+  - audio size is within limits
+  - transcription latency remains stable
+  - model/prompt changes are taking effect

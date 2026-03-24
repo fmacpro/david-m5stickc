@@ -4,6 +4,8 @@ export interface Env {
   DEBUG_ERRORS?: string;
   CHAT_MODEL?: string;
   TRANSCRIBE_MODEL?: string;
+  TRANSCRIBE_LANGUAGE?: string;
+  TRANSCRIBE_PROMPT?: string;
   TTS_MODEL?: string;
   TTS_VOICE?: string;
   TTS_INSTRUCTIONS?: string;

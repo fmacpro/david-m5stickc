@@ -4,25 +4,47 @@ import type { Env, Turn } from "../types";
 export async function transcribeFile(
   audio: File,
   env: Env
-): Promise<{ ok: true; text: string } | { ok: false; error: Response }> {
+): Promise<
+  | {
+      ok: true;
+      text: string;
+      meta: { sttMs: number; audioBytes: number; model: string };
+    }
+  | { ok: false; error: Response }
+> {
+  const model = env.TRANSCRIBE_MODEL || "gpt-4o-transcribe";
+  const language = env.TRANSCRIBE_LANGUAGE || "en";
+  const prompt =
+    env.TRANSCRIBE_PROMPT ||
+    [
+      "Transcribe spoken British English exactly.",
+      "Preserve complete user intent and sentence structure.",
+      "Do not summarise or shorten long questions.",
+      "Do not omit trailing words at the end of long utterances.",
+      "Keep names and numbers accurate.",
+      "Prefer best-guess words over ellipses.",
+    ].join(" ");
   const upstream = new FormData();
   upstream.set("file", audio, audio.name || "audio.wav");
-  upstream.set("model", env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe");
-  upstream.set("language", "en");
-  upstream.set(
-    "prompt",
-    "Short conversational speech from a tiny robot user. Prefer complete words."
-  );
+  upstream.set("model", model);
+  upstream.set("language", language);
+  upstream.set("prompt", prompt);
+  const sttStart = Date.now();
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
     body: upstream,
   });
+  const sttMs = Math.max(0, Date.now() - sttStart);
   const text = await resp.text();
   if (!resp.ok) return { ok: false, error: proxyJson(resp.status, text) };
   try {
     const parsed = JSON.parse(text) as { text?: string };
-    return { ok: true, text: parsed.text || "" };
+    return {
+      ok: true,
+      text: parsed.text || "",
+      meta: { sttMs, audioBytes: audio.size, model },
+    };
   } catch {
     return { ok: false, error: json({ error: "Invalid STT response" }, 502) };
   }

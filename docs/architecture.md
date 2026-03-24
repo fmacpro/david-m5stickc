@@ -8,8 +8,8 @@ David is split into two primary parts:
 ## High-Level Flow
 
 1. Button press starts mic capture on device
-2. Firmware captures audio chunks and transcribes speech
-3. Firmware calls worker `/v1/voice-turn-text` with transcript + sensor context
+2. Firmware captures a full hold-to-talk WAV utterance
+3. Firmware calls worker `/v1/voice-turn` with audio + sensor context
 4. Worker:
    - validates request signature
    - repairs transcript
@@ -31,7 +31,7 @@ David is split into two primary parts:
 ## Worker Components
 
 - `src/index.ts`: request routing + auth + limits
-- `src/routes/*`: endpoint handlers (`stt`, `chat`, `tts`)
+- `src/routes/*`: endpoint handlers (`chat`, `tts`)
 - `src/services/*`: OpenAI calls, state storage, voice-turn orchestration
 - `src/security/*`: HMAC auth, replay protection, rate limiting
 - `src/intent/*`: intent detection and screen action generation

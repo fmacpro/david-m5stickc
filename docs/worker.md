@@ -81,8 +81,8 @@ npx wrangler deployments list
 
 ## API Endpoints Used by Firmware
 
-- `POST /v1/stt-raw`
-- `POST /v1/voice-turn-text`
+- `POST /v1/voice-turn`
+- `POST /v1/voice-turn-text` (text-only fallback path)
 - `POST /v1/tts`
 
 All protected routes require signed auth headers.

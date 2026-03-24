@@ -63,17 +63,16 @@ bool runTurnCore(VoiceTurnContext& ctx, String& heard, bool injected, String& er
             "Listening...",
             (attempt == 0) ? String("Speak now") : String("Try again"));
       }
-      if (!ctx.captureTranscriptChunked || !ctx.captureTranscriptChunked(heard, err)) {
-        logTurnError(ctx, "TURN CAPTURE", err);
-        return false;
-      }
       if (!ctx.ensureWifiConnected || !ctx.ensureWifiConnected(err)) {
         logTurnError(ctx, "TURN WIFI", err);
         return false;
       }
-      if (ctx.setUiRaw) ctx.setUiRaw(ctx.ui_thinking_state, "Cloud turn...", "STT+Chat+TTS");
-      if (ctx.requestVoiceTurnText &&
-          ctx.requestVoiceTurnText(heard, wav, wav_len, heard, reply, screen_action, err)) {
+      if (!ctx.requestVoiceTurnAudio) {
+        err = "Voice-turn audio path missing";
+        logTurnError(ctx, "TURN CONFIG", err);
+        return false;
+      }
+      if (ctx.requestVoiceTurnAudio(wav, wav_len, heard, reply, screen_action, err)) {
         break;
       }
       if (!(attempt == 0 && ctx.isNoSpeechError && ctx.isNoSpeechError(err))) {

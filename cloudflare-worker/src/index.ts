@@ -1,6 +1,5 @@
 import { json, withCors } from "./core/http";
 import { handleChat } from "./routes/chat";
-import { handleStt, handleSttRaw } from "./routes/stt";
 import { handleTts } from "./routes/tts";
 import { authenticate, enforceRateLimit } from "./security/auth";
 import { sha256Hex } from "./security/crypto";
@@ -56,12 +55,6 @@ export default {
         body: bodyBytes,
       });
 
-      if (url.pathname === "/v1/stt") {
-        return withCors(await handleStt(reqForParsing, env));
-      }
-      if (url.pathname === "/v1/stt-raw") {
-        return withCors(await handleSttRaw(reqForParsing, env));
-      }
       if (url.pathname === "/v1/chat") {
         return withCors(await handleChat(reqForParsing, env));
       }
