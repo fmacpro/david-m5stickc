@@ -105,32 +105,34 @@ void drawSpeakingFeaturesFrame(bool eyes_closed, uint8_t speaking_level, unsigne
 
 void drawFace(const FaceRenderModel& m) {
   if (m.overlay_active && m.now_ms < m.overlay_until_ms && m.state != kStateSpeaking) {
-    M5.Display.fillScreen(BLACK);
     const uint16_t c = GREEN;
     if (m.overlay_mode == "draw") {
+      M5.Display.fillScreen(BLACK);
       drawCenteredScript(m.overlay_draw, c);
     } else if (m.overlay_mode == "image") {
-      if (m.overlay_value.length() > 0) {
-        File f = SPIFFS.open(m.overlay_value, FILE_READ);
-        const size_t len = f ? static_cast<size_t>(f.size()) : 0;
-        if (!f || len < 256 || len > 150000) {
-          drawCenteredFitText("IMAGE ERR", 30, 150, 2, 1, c);
-        } else {
-          uint8_t* jpg = static_cast<uint8_t*>(malloc(len));
-          size_t got = 0;
-          if (jpg) got = f.read(jpg, len);
-          f.close();
-          if (!jpg || got != len || !M5.Display.drawJpg(jpg, got, 0, 0)) {
-            drawCenteredFitText("IMAGE ERR", 30, 150, 2, 1, c);
+      // Keep image overlay stable if another UI path has repainted the display.
+      if (SPIFFS.exists(m.overlay_value.c_str())) {
+        File imgf = SPIFFS.open(m.overlay_value.c_str(), FILE_READ);
+        if (imgf) {
+          M5.Display.fillScreen(BLACK);
+          bool ok = M5.Display.drawJpg(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
+          if (!ok) {
+            imgf.seek(0, SeekSet);
+            ok = M5.Display.drawPng(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
           }
-          if (jpg) free(jpg);
+          if (!ok) {
+            imgf.seek(0, SeekSet);
+            (void)M5.Display.drawBmp(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
+          }
+          imgf.close();
         }
-      } else {
-        drawCenteredFitText("NO IMAGE", 30, 150, 2, 1, c);
       }
+      return;
     } else if (m.overlay_mode == "big_time") {
+      M5.Display.fillScreen(BLACK);
       drawCenteredFitText(m.overlay_value, 24, 150, 4, 2, c);
     } else if (m.overlay_mode == "big_battery") {
+      M5.Display.fillScreen(BLACK);
       const int bw = 74;
       const int bh = 34;
       const int terminalW = 4;
@@ -140,6 +142,7 @@ void drawFace(const FaceRenderModel& m) {
       String pct = String(m.overlay_percent) + "%";
       drawCenteredFitText(pct, 52, 150, 2, 1, c);
     } else if (m.overlay_mode == "big_temp") {
+      M5.Display.fillScreen(BLACK);
       const int tw = 16;
       const int th = 28;
       const int tx = 24;
@@ -160,6 +163,7 @@ void drawFace(const FaceRenderModel& m) {
       drawFitTextInRect("TEMP", textX, 12, textW, 14, 1, 1, c);
       drawFitTextInRect(m.overlay_value, textX, 28, textW, 34, 3, 1, c);
     } else if (m.overlay_mode == "big_rssi") {
+      M5.Display.fillScreen(BLACK);
       const int bx = 24;
       const int by = 30;
       const int bw = 8;
@@ -173,9 +177,11 @@ void drawFace(const FaceRenderModel& m) {
       }
       drawCenteredFitText(m.overlay_value, 52, 150, 2, 1, c);
     } else if (m.overlay_mode == "big_date") {
+      M5.Display.fillScreen(BLACK);
       if (m.overlay_title.length() > 0) drawCenteredFitText(m.overlay_title, 18, 150, 1, 1, c);
       drawCenteredFitText(m.overlay_value, 36, 150, 2, 1, c);
     } else if (m.overlay_mode == "big_value") {
+      M5.Display.fillScreen(BLACK);
       if (m.overlay_title.length() > 0) drawCenteredFitText(m.overlay_title, 16, 150, 1, 1, c);
       String line1, line2;
       if (splitIntoTwoBalancedLines(m.overlay_value, line1, line2)) {
@@ -193,6 +199,7 @@ void drawFace(const FaceRenderModel& m) {
         drawCenteredFitText(m.overlay_value, y, 156, maxSize, 1, c);
       }
     } else {
+      M5.Display.fillScreen(BLACK);
       if (m.overlay_title.length() > 0) drawCenteredFitText(m.overlay_title, 16, 150, 1, 1, c);
       drawCenteredFitText(m.overlay_value, 34, 150, 2, 1, c);
     }

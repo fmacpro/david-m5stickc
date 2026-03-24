@@ -16,7 +16,6 @@ import {
 } from "../intent/screen";
 import {
   generateReply,
-  repairTranscript,
   transcribeFile,
 } from "./openai";
 import {
@@ -94,48 +93,29 @@ async function completeVoiceTurn(
   chunkedTts: boolean,
   sttMeta?: { sttMs: number; audioBytes: number; model: string }
 ): Promise<Response> {
-  const cleanedOriginalTranscript = sanitizeTranscriptIntentNoise(
+  const normalizedTranscript = sanitizeTranscriptIntentNoise(
     stripSttPromptLeak(transcript)
   );
-  const repairedTranscriptRaw = await repairTranscript(
-    env,
-    cleanedOriginalTranscript,
-    sensorContext
-  );
-  const repairedTranscript = sanitizeTranscriptIntentNoise(
-    stripSttPromptLeak(repairedTranscriptRaw)
-  );
-
-  const originalLower = cleanedOriginalTranscript.toLowerCase();
-  const repairedLower = repairedTranscript.toLowerCase();
-  const combinedLower = `${originalLower} ${repairedLower}`.trim();
-  const originalTimeIntent = isTimeIntent(originalLower);
-  const originalBatteryIntent = isBatteryIntent(originalLower);
-  const originalDrawIntent = isDrawIntent(originalLower);
-  const repairedTimeIntent = isTimeIntent(repairedLower);
-  const repairedBatteryIntent = isBatteryIntent(repairedLower);
-  const repairedDrawIntent = isDrawIntent(repairedLower);
-  const pictureQuery =
-    extractPictureQuery(repairedTranscript) ||
-    extractPictureQuery(cleanedOriginalTranscript);
+  const transcriptLower = normalizedTranscript.toLowerCase();
+  const timeIntent = isTimeIntent(transcriptLower);
+  const batteryIntent = isBatteryIntent(transcriptLower);
+  const drawIntent = isDrawIntent(transcriptLower);
+  const pictureQuery = extractPictureQuery(normalizedTranscript);
 
   const history = await getHistory(env, deviceId);
   const memory = await getMemoryFacts(env, deviceId);
-  const memCmd = parseMemoryCommand(repairedTranscript);
+  const memCmd = parseMemoryCommand(normalizedTranscript);
   const forcedDrawAction = pictureQuery
     ? null
-    : iconScreenActionFromTranscript(repairedTranscript, sensorContext) ||
-      iconScreenActionFromTranscript(cleanedOriginalTranscript, sensorContext);
+    : iconScreenActionFromTranscript(normalizedTranscript, sensorContext);
   let deterministicAction: ScreenAction | null = null;
 
   let finalReply = "";
-  const wantsDate = isDateIntent(combinedLower);
-  const wantsWifi = isWifiIntent(combinedLower);
-  const wantsTemp = isTempIntent(combinedLower);
-  const wantsTime =
-    originalTimeIntent ||
-    repairedTimeIntent;
-  const wantsBattery = originalBatteryIntent || repairedBatteryIntent;
+  const wantsDate = isDateIntent(transcriptLower);
+  const wantsWifi = isWifiIntent(transcriptLower);
+  const wantsTemp = isTempIntent(transcriptLower);
+  const wantsTime = timeIntent;
+  const wantsBattery = batteryIntent;
   const statusIntentCount =
     (wantsDate ? 1 : 0) +
     (wantsWifi ? 1 : 0) +
@@ -143,7 +123,7 @@ async function completeVoiceTurn(
     (wantsTime ? 1 : 0) +
     (wantsBattery ? 1 : 0);
 
-  if (!pictureQuery && statusIntentCount >= 2 && !originalDrawIntent && !repairedDrawIntent) {
+  if (!pictureQuery && statusIntentCount >= 2 && !drawIntent) {
     const parts: string[] = [];
     if (wantsDate) {
       const localDate = extractLocalDate(sensorContext);
@@ -175,8 +155,8 @@ async function completeVoiceTurn(
 
   if (!finalReply && pictureQuery) {
     finalReply = `Showing a picture of ${pictureQuery}.`;
-    deterministicAction = { mode: "image", value: pictureQuery, ttl_ms: 12000 };
-  } else if (!finalReply && originalBatteryIntent && !originalTimeIntent && !originalDrawIntent) {
+    deterministicAction = { mode: "image", value: pictureQuery, ttl_ms: 15000 };
+  } else if (!finalReply && batteryIntent && !timeIntent && !drawIntent) {
     const pct = extractBatteryPercent(sensorContext);
     const charging = extractCharging(sensorContext);
     if (pct >= 0) {
@@ -193,36 +173,7 @@ async function completeVoiceTurn(
     } else {
       finalReply = "I can't read battery level right now.";
     }
-  } else if (!finalReply && originalTimeIntent && !originalDrawIntent) {
-    const hhmm = extractLocalTimeHHMM(sensorContext);
-    if (hhmm.length > 0) {
-      finalReply = `It's ${hhmm} in your local time.`;
-      deterministicAction = { mode: "big_time", value: hhmm, ttl_ms: 8000 };
-    } else {
-      finalReply = "I can't read the local time right now.";
-    }
-  } else if (!finalReply && repairedBatteryIntent && !repairedTimeIntent && !repairedDrawIntent) {
-    const pct = extractBatteryPercent(sensorContext);
-    const charging = extractCharging(sensorContext);
-    if (pct >= 0) {
-      finalReply = charging
-        ? `Battery is ${pct}% and charging.`
-        : `Battery is ${pct}%.`;
-      deterministicAction = {
-        mode: "big_battery",
-        value: `${pct}%`,
-        percent: pct,
-        charging,
-        ttl_ms: 8000,
-      };
-    } else {
-      finalReply = "I can't read battery level right now.";
-    }
-  } else if (
-    !finalReply &&
-    repairedTimeIntent &&
-    !repairedDrawIntent
-  ) {
+  } else if (!finalReply && timeIntent && !drawIntent) {
     const hhmm = extractLocalTimeHHMM(sensorContext);
     if (hhmm.length > 0) {
       finalReply = `It's ${hhmm} in your local time.`;
@@ -242,11 +193,11 @@ async function completeVoiceTurn(
   } else if (!finalReply && memCmd.action === "recall") {
     finalReply = recallMemoryReply(memory);
   } else if (!finalReply && forcedDrawAction) {
-    finalReply = sanitizeDrawReplySpeech(repairedTranscript);
+    finalReply = sanitizeDrawReplySpeech(normalizedTranscript);
   } else {
     const reply = await generateReply(
       env,
-      repairedTranscript,
+      normalizedTranscript,
       history,
       sensorContext,
       memory
@@ -261,40 +212,36 @@ async function completeVoiceTurn(
   }
 
   finalReply = stripSpeechMarkdown(finalReply);
-  await appendHistory(env, deviceId, { user: repairedTranscript, assistant: finalReply }, history);
+  await appendHistory(env, deviceId, { user: normalizedTranscript, assistant: finalReply }, history);
   const screenAction = deterministicAction
     ? deterministicAction
     : forcedDrawAction
     ? forcedDrawAction
     : await generateScreenAction(
         env,
-        repairedTranscript,
+        normalizedTranscript,
         finalReply,
         sensorContext
       );
 
   const safeScreenAction =
     screenAction.mode === "none"
-      ? fallbackScreenAction(repairedTranscript, finalReply, sensorContext)
+      ? fallbackScreenAction(normalizedTranscript, finalReply, sensorContext)
       : screenAction;
   const finalizedScreenAction = finalizeScreenAction(
     safeScreenAction,
-    repairedTranscript,
+    normalizedTranscript,
     finalReply,
     sensorContext
   );
   if (finalizedScreenAction.mode === "draw") {
-    finalReply = sanitizeDrawReplySpeech(repairedTranscript);
+    finalReply = sanitizeDrawReplySpeech(normalizedTranscript);
   }
 
   if (chunkedTts) {
     const headers = new Headers();
     headers.set("Cache-Control", "no-store");
-    headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
-    headers.set(
-      "x-transcript-original",
-      encodeHeaderValue(cleanedOriginalTranscript, 1200)
-    );
+    headers.set("x-transcript", encodeHeaderValue(normalizedTranscript));
     headers.set("x-reply", encodeHeaderValue(finalReply, 1200));
     headers.set(
       "x-screen",
@@ -351,11 +298,7 @@ async function completeVoiceTurn(
   const headers = new Headers();
   headers.set("Content-Type", ttsResp.headers.get("content-type") || "audio/wav");
   headers.set("Cache-Control", "no-store");
-  headers.set("x-transcript", encodeHeaderValue(repairedTranscript));
-  headers.set(
-    "x-transcript-original",
-    encodeHeaderValue(cleanedOriginalTranscript, 1200)
-  );
+  headers.set("x-transcript", encodeHeaderValue(normalizedTranscript));
   headers.set("x-reply", encodeHeaderValue(finalReply));
   headers.set(
     "x-screen",

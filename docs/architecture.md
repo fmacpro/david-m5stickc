@@ -12,7 +12,7 @@ David is split into two primary parts:
 3. Firmware calls worker `/v1/voice-turn` with audio + sensor context
 4. Worker:
    - validates request signature
-   - repairs transcript
+   - transcribes request audio
    - generates LLM reply
    - selects screen action
 5. Firmware requests TTS from worker `/v1/tts`

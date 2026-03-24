@@ -595,6 +595,31 @@ static void applyScreenAction(const String& encoded_json) {
       drawFace();
       return;
     }
+    bool drawn_now = false;
+    File imgf = SPIFFS.open(kOverlayImagePath, FILE_READ);
+    if (!imgf) {
+      logLine("[SCREEN] image file reopen failed");
+      clearOverlay();
+      drawFace();
+      return;
+    }
+    M5.Display.fillScreen(BLACK);
+    drawn_now = M5.Display.drawJpg(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
+    if (!drawn_now) {
+      imgf.seek(0, SeekSet);
+      drawn_now = M5.Display.drawPng(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
+    }
+    if (!drawn_now) {
+      imgf.seek(0, SeekSet);
+      drawn_now = M5.Display.drawBmp(&imgf, 0, 0, 160, 80, 0, 0, 0.0f, 0.0f, middle_center);
+    }
+    imgf.close();
+    if (!drawn_now) {
+      logLine("[SCREEN] image decode failed");
+      clearOverlay();
+      drawFace();
+      return;
+    }
     value = kOverlayImagePath;
     if (img_title.length() > 0) {
       logLine(String("[SCREEN] image title=") + truncateForScreen(img_title, 72));
@@ -1474,7 +1499,7 @@ static bool requestPictureJpeg(
   }
 
   const String resp_type = http.header("Content-Type");
-  if (resp_type.indexOf("image/jpeg") < 0) {
+  if (resp_type.indexOf("image/") < 0) {
     const String payload = http.getString();
     http.end();
     err = "Unexpected image type: " + resp_type + " " + truncateForScreen(payload, 50);
@@ -1502,6 +1527,13 @@ static bool requestPictureJpeg(
   const bool full = readFully(*stream, jpg_out, static_cast<size_t>(len), 6000, got);
   http.end();
   jpg_len = got;
+  if (jpg_len >= 4) {
+    char sig[16];
+    snprintf(sig, sizeof(sig), "%02X%02X%02X%02X", jpg_out[0], jpg_out[1], jpg_out[2], jpg_out[3]);
+    logLine(String("[PICTURE] type=") + resp_type + " len=" + String(jpg_len) + " sig=" + String(sig));
+  } else {
+    logLine(String("[PICTURE] type=") + resp_type + " len=" + String(jpg_len));
+  }
   if (!full || jpg_len < 256) {
     free(jpg_out);
     jpg_out = nullptr;
@@ -1792,13 +1824,12 @@ static bool requestVoiceTurnAudio(
     const char* header_keys[] = {
         "Content-Type",
         "x-transcript",
-        "x-transcript-original",
         "x-reply",
         "x-screen",
         "x-stt-ms",
         "x-audio-bytes",
         "x-stt-model"};
-    http.collectHeaders(header_keys, 8);
+    http.collectHeaders(header_keys, 7);
     http.addHeader("Content-Type", content_type);
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-timestamp", ts);
@@ -1838,7 +1869,6 @@ static bool requestVoiceTurnAudio(
     }
 
     transcript = urlDecode(http.header("x-transcript"));
-    const String transcript_original = urlDecode(http.header("x-transcript-original"));
     reply = urlDecode(http.header("x-reply"));
     screen_action = http.header("x-screen");
     const String stt_ms = http.header("x-stt-ms");
@@ -1850,11 +1880,6 @@ static bool requestVoiceTurnAudio(
               " audio_bytes=" + audio_bytes +
               " captured_samples=" + String(captured_samples));
     }
-    if (transcript_original.length() > 0 && transcript_original != transcript) {
-      logLine(String("[STT ORIG] ") + transcript_original);
-      logLine(String("[STT FIXD] ") + transcript);
-    }
-
     if (code == 204) {
       http.end();
       cleanup();
@@ -1943,8 +1968,8 @@ static bool requestVoiceTurnText(
       continue;
     }
     http.setTimeout(30000);
-    const char* header_keys[] = {"Content-Type", "x-transcript", "x-transcript-original", "x-reply", "x-screen"};
-    http.collectHeaders(header_keys, 5);
+    const char* header_keys[] = {"Content-Type", "x-transcript", "x-reply", "x-screen"};
+    http.collectHeaders(header_keys, 4);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-timestamp", ts);
@@ -1976,13 +2001,8 @@ static bool requestVoiceTurnText(
     }
 
     transcript = urlDecode(http.header("x-transcript"));
-    const String transcript_original = urlDecode(http.header("x-transcript-original"));
     reply = urlDecode(http.header("x-reply"));
     screen_action = http.header("x-screen");
-    if (transcript_original.length() > 0 && transcript_original != transcript) {
-      logLine(String("[STT ORIG] ") + transcript_original);
-      logLine(String("[STT FIXD] ") + transcript);
-    }
 
     if (code == 204) {
       http.end();
@@ -2135,6 +2155,7 @@ static void handleSerialDebugInput() {
 }
 
 static void updateBlink() {
+  if (g_overlay_active && g_overlay_mode == "image") return;
   if (g_state == FaceState::Speaking || g_low_power_idle) return;
   const unsigned long now = millis();
   if (!g_eyes_closed && now >= g_next_blink_at) {

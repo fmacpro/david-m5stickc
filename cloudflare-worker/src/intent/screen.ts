@@ -497,7 +497,7 @@ export function finalizeScreenAction(
     return {
       mode: "image",
       value: action.value,
-      ttl_ms: action.ttl_ms ?? 12000,
+      ttl_ms: action.ttl_ms ?? 15000,
     };
   }
 

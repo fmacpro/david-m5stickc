@@ -9,7 +9,7 @@ type CommonsSearchResponse = {
 
 type CommonsPage = {
   title?: string;
-  imageinfo?: Array<{ url?: string }>;
+  imageinfo?: Array<{ url?: string; thumburl?: string }>;
 };
 
 type CommonsPages = Record<string, CommonsPage>;
@@ -79,7 +79,10 @@ export async function handlePicture(request: Request, env: Env): Promise<Respons
   }
 
   const headers = new Headers();
-  headers.set("Content-Type", "image/jpeg");
+  headers.set(
+    "Content-Type",
+    imageResp.headers.get("content-type") || "image/jpeg"
+  );
   headers.set("Cache-Control", "public, max-age=86400");
   headers.set("x-image-title", encodeURIComponent(candidate.title.slice(0, 180)));
   headers.set("x-image-source", encodeURIComponent(candidate.sourceUrl.slice(0, 900)));
@@ -121,6 +124,7 @@ async function findByGeneratorSearch(
   api.searchParams.set("gsrsearch", query);
   api.searchParams.set("prop", "imageinfo");
   api.searchParams.set("iiprop", "url");
+  api.searchParams.set("iiurlwidth", "180");
 
   const resp = await sourceFetch(api.toString());
   if (!resp.ok) {
@@ -179,6 +183,7 @@ async function findByListSearch(query: string, trace: string[]): Promise<Commons
   infoApi.searchParams.set("origin", "*");
   infoApi.searchParams.set("prop", "imageinfo");
   infoApi.searchParams.set("iiprop", "url");
+  infoApi.searchParams.set("iiurlwidth", "180");
   infoApi.searchParams.set("titles", titles.slice(0, 8).join("|"));
 
   const infoResp = await sourceFetch(infoApi.toString());
@@ -202,7 +207,11 @@ function pickCandidateFromPages(pages: CommonsPages | undefined): CommonsCandida
   if (!pages) return null;
   for (const page of Object.values(pages)) {
     const title = (page.title || "").trim();
-    const sourceUrl = (page.imageinfo?.[0]?.url || "").trim();
+    const sourceUrl = (
+      page.imageinfo?.[0]?.thumburl ||
+      page.imageinfo?.[0]?.url ||
+      ""
+    ).trim();
     if (!title || !sourceUrl) continue;
     if (!isRasterImage(sourceUrl)) continue;
     return { title, sourceUrl };
@@ -232,7 +241,7 @@ async function findByWikipediaThumbnail(
   api.searchParams.set("gsrlimit", "4");
   api.searchParams.set("gsrsearch", query);
   api.searchParams.set("prop", "pageimages");
-  api.searchParams.set("pithumbsize", "640");
+  api.searchParams.set("pithumbsize", "360");
   api.searchParams.set("piprop", "thumbnail");
 
   const resp = await sourceFetch(api.toString());
@@ -342,19 +351,7 @@ async function findByOpenverse(query: string, trace: string[]): Promise<CommonsC
 }
 
 async function fetchOptimizedImage(sourceUrl: string): Promise<Response> {
-  return sourceFetch(sourceUrl, {
-    method: "GET",
-    cf: {
-      image: {
-        width: 160,
-        height: 80,
-        fit: "cover",
-        format: "jpeg",
-        quality: 64,
-        metadata: "none",
-      },
-    },
-  } as RequestInit);
+  return sourceFetch(sourceUrl, { method: "GET" } as RequestInit);
 }
 
 async function sourceFetch(url: string, init?: RequestInit): Promise<Response> {
