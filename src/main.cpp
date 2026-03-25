@@ -33,7 +33,7 @@ static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
 static constexpr size_t kMinTurnCaptureMs = 1400;
 static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
 static constexpr size_t kRecordChunk = 512;
-static constexpr size_t kMicWarmupMs = 0;
+static constexpr size_t kMicWarmupMs = 5;
 static constexpr size_t kPreRollMs = 150;
 static constexpr size_t kPreRollSamples = (kSampleRate * kPreRollMs) / 1000;
 static constexpr size_t kReleaseTailMs = 50;
@@ -41,7 +41,7 @@ static constexpr size_t kTurnCaptureMaxMs = 58000;
 static constexpr size_t kCaptureFileReserveBytes = 12288;
 static constexpr size_t kTurnUploadSoftMaxBytes = 1850000;
 // Mic front-end tuning for better STT clarity on natural speech/accents.
-static constexpr int kMicMagnification = 24;
+static constexpr int kMicMagnification = 20;
 static constexpr int kMicNoiseFilterLevel = 1;
 // Speaker tuning to reduce hiss/static on tiny speaker hats.
 static constexpr int kSpeakerVolume = 185;
@@ -138,6 +138,7 @@ static bool requestPictureJpeg(
     String& image_title,
     String& image_source,
     String& err);
+
 static bool requestVoiceTurnAudio(
     uint8_t*& wav_out,
     size_t& wav_len,
@@ -961,7 +962,6 @@ static bool captureTurnWavToFile(const String& wav_path, size_t& total_samples, 
       M5.Mic.record(trash, chunk, kSampleRate);
       warm_left -= chunk;
     }
-
     size_t got_preroll = 0;
     while (got_preroll < kPreRollSamples) {
       size_t chunk = kPreRollSamples - got_preroll;
@@ -1895,7 +1895,9 @@ static bool requestVoiceTurnAudio(
       logLine(String("[STT DBG] model=") + stt_model +
               " stt_ms=" + stt_ms +
               " audio_bytes=" + audio_bytes +
-              " captured_samples=" + String(captured_samples));
+              " captured_samples=" + String(captured_samples) +
+              " avg_abs=" + String(g_last_avg_abs) +
+              " peak=" + String(g_last_peak));
     }
     if (code == 204) {
       http.end();
