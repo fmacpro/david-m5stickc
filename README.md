@@ -14,6 +14,7 @@ David is a tiny voice-first robot companion:
 - Push-to-talk conversation (STT -> LLM -> TTS)
 - Answers spoken questions naturally
 - Speaks responses and shows glance-friendly visual overlays
+- Can fetch and display pictures on-screen when asked (for example "show me a cat")
 - Supports tamagotchi-style interactions like feeding and patting
 - Can draw simple shapes/icons on screen when asked
 - Reports internal device status (for example battery, time/date, and sensor context)

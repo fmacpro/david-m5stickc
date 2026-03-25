@@ -14,9 +14,10 @@ David is split into two primary parts:
    - validates request signature
    - transcribes request audio
    - generates LLM reply
-   - selects screen action
+   - selects screen action (status overlay, icon draw, or picture intent)
 5. Firmware requests TTS from worker `/v1/tts`
-6. Firmware plays audio and renders face/overlay state
+6. If screen action is picture, firmware requests worker `/v1/picture`
+7. Firmware plays audio and renders face/overlay state
 
 ## Firmware Components
 
@@ -31,7 +32,7 @@ David is split into two primary parts:
 ## Worker Components
 
 - `src/index.ts`: request routing + auth + limits
-- `src/routes/*`: endpoint handlers (`chat`, `tts`)
+- `src/routes/*`: endpoint handlers (`chat`, `tts`, `picture`)
 - `src/services/*`: OpenAI calls, state storage, voice-turn orchestration
 - `src/security/*`: HMAC auth, replay protection, rate limiting
 - `src/intent/*`: intent detection and screen action generation

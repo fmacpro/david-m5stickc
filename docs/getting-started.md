@@ -142,4 +142,8 @@ pio device monitor -p /dev/ttyUSB0 -b 115200
 - Ask: `What time is it?`
 - Expected: spoken response + matching screen overlay
 
+Optional picture test:
+- Ask: `Show me a picture of a cat`
+- Expected: spoken confirmation + picture rendered on display
+
 If anything fails, continue with [Troubleshooting](troubleshooting.md).

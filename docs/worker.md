@@ -84,6 +84,7 @@ npx wrangler deployments list
 - `POST /v1/voice-turn`
 - `POST /v1/voice-turn-text` (text-only fallback path)
 - `POST /v1/tts`
+- `POST /v1/picture`
 
 All protected routes require signed auth headers.
 
