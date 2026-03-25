@@ -33,6 +33,7 @@ static constexpr size_t kSttChunkMinSamples = (kSampleRate * 420) / 1000;
 static constexpr size_t kMinTurnCaptureMs = 1400;
 static constexpr size_t kMinTurnCaptureSamples = (kSampleRate * kMinTurnCaptureMs) / 1000;
 static constexpr size_t kRecordChunk = 512;
+static constexpr size_t kIdlePreRollChunk = 160;
 static constexpr size_t kMicWarmupMs = 5;
 static constexpr size_t kPreRollMs = 150;
 static constexpr size_t kPreRollSamples = (kSampleRate * kPreRollMs) / 1000;
@@ -87,6 +88,9 @@ static bool g_fs_ready = false;
 static uint8_t g_mic_magnification = kMicMagnification;
 static uint8_t g_mic_noise_filter_level = kMicNoiseFilterLevel;
 static int16_t g_preroll_buf[kPreRollSamples];
+static int16_t g_idle_preroll_ring[kPreRollSamples];
+static size_t g_idle_preroll_write = 0;
+static size_t g_idle_preroll_count = 0;
 static constexpr const char* kOverlayImagePath = "/overlay_img.jpg";
 static uint32_t g_voice_turn_seq = 0;
 static uint32_t g_voice_turn_active = 0;
@@ -115,6 +119,9 @@ static const CloudClientConfig kCloudConfig = {
 
 static void drawFace();
 static void setUi(FaceState state, const String& status, const String& detail);
+static void resetIdlePreRollBuffer();
+static void updateIdlePreRollBuffer();
+static size_t copyIdlePreRollSnapshot(int16_t* out, size_t cap);
 static int clampNeed(int value);
 static void startReaction(ReactionKind kind, unsigned long ttl_ms);
 static bool speakActionResponse(const String& action);
@@ -166,6 +173,7 @@ static void startMicIfNeeded() {
   if (g_mic_started) return;
   M5.Mic.begin();
   g_mic_started = true;
+  resetIdlePreRollBuffer();
 }
 
 static void stopMicIfNeeded() {
@@ -173,6 +181,38 @@ static void stopMicIfNeeded() {
   while (M5.Mic.isRecording()) M5.delay(1);
   M5.Mic.end();
   g_mic_started = false;
+  resetIdlePreRollBuffer();
+}
+
+static void resetIdlePreRollBuffer() {
+  g_idle_preroll_write = 0;
+  g_idle_preroll_count = 0;
+}
+
+static void updateIdlePreRollBuffer() {
+  if (g_state != FaceState::Idle) return;
+  if (g_low_power_idle) return;
+  if (!g_mic_started || !M5.Mic.isEnabled()) return;
+  if (M5.BtnA.isPressed() || M5.BtnB.isPressed()) return;
+
+  int16_t chunk[kIdlePreRollChunk];
+  if (!M5.Mic.record(chunk, kIdlePreRollChunk, kSampleRate)) return;
+
+  for (size_t i = 0; i < kIdlePreRollChunk; ++i) {
+    g_idle_preroll_ring[g_idle_preroll_write] = chunk[i];
+    g_idle_preroll_write = (g_idle_preroll_write + 1) % kPreRollSamples;
+    if (g_idle_preroll_count < kPreRollSamples) ++g_idle_preroll_count;
+  }
+}
+
+static size_t copyIdlePreRollSnapshot(int16_t* out, size_t cap) {
+  if (!out || cap == 0 || g_idle_preroll_count == 0) return 0;
+  const size_t available = min(cap, g_idle_preroll_count);
+  const size_t start = (g_idle_preroll_write + kPreRollSamples - available) % kPreRollSamples;
+  for (size_t i = 0; i < available; ++i) {
+    out[i] = g_idle_preroll_ring[(start + i) % kPreRollSamples];
+  }
+  return available;
 }
 
 static void applyMicConfig(uint8_t magnification, uint8_t noise_filter_level) {
@@ -952,17 +992,19 @@ static bool captureTurnWavToFile(const String& wav_path, size_t& total_samples, 
   uint64_t sum_abs = 0;
   int peak = 0;
   {
-    // Capture a short pre-roll and prepend it so first words are less likely
-    // to be clipped when users begin speaking right on button press.
-    const size_t warmup_samples = (kSampleRate * kMicWarmupMs) / 1000;
-    int16_t trash[160];
-    size_t warm_left = warmup_samples;
-    while (warm_left > 0) {
-      const size_t chunk = (warm_left > 160) ? 160 : warm_left;
-      M5.Mic.record(trash, chunk, kSampleRate);
-      warm_left -= chunk;
+    // Snapshot circular idle mic history so we include true pre-press audio.
+    size_t got_preroll = copyIdlePreRollSnapshot(g_preroll_buf, kPreRollSamples);
+    // If we do not have enough idle history yet, top up post-press samples.
+    if (got_preroll == 0) {
+      const size_t warmup_samples = (kSampleRate * kMicWarmupMs) / 1000;
+      int16_t trash[160];
+      size_t warm_left = warmup_samples;
+      while (warm_left > 0) {
+        const size_t chunk = (warm_left > 160) ? 160 : warm_left;
+        M5.Mic.record(trash, chunk, kSampleRate);
+        warm_left -= chunk;
+      }
     }
-    size_t got_preroll = 0;
     while (got_preroll < kPreRollSamples) {
       size_t chunk = kPreRollSamples - got_preroll;
       if (chunk > kRecordChunk) chunk = kRecordChunk;
@@ -2263,6 +2305,7 @@ void setup() {
 void loop() {
   M5.update();
   handleSerialDebugInput();
+  updateIdlePreRollBuffer();
   const unsigned long now = millis();
   const bool btnA_pressed = M5.BtnA.wasPressed();
   const bool btnB_pressed = M5.BtnB.wasPressed();

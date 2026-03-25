@@ -24,11 +24,34 @@ export async function transcribeFile(
       "Keep names and numbers accurate.",
       "Prefer best-guess words over ellipses.",
     ].join(" ");
+
+  const stt = await callTranscription(audio, env, {
+    model,
+    language,
+    prompt,
+  });
+  if (!stt.ok) return { ok: false, error: stt.error };
+
+  return {
+    ok: true,
+    text: stt.text.trim(),
+    meta: { sttMs: stt.sttMs, audioBytes: audio.size, model },
+  };
+}
+
+async function callTranscription(
+  audio: File,
+  env: Env,
+  opts: { model: string; language: string; prompt: string }
+): Promise<
+  | { ok: true; text: string; sttMs: number }
+  | { ok: false; error: Response }
+> {
   const upstream = new FormData();
   upstream.set("file", audio, audio.name || "audio.wav");
-  upstream.set("model", model);
-  upstream.set("language", language);
-  upstream.set("prompt", prompt);
+  upstream.set("model", opts.model);
+  upstream.set("language", opts.language);
+  upstream.set("prompt", opts.prompt);
   const sttStart = Date.now();
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
@@ -40,11 +63,7 @@ export async function transcribeFile(
   if (!resp.ok) return { ok: false, error: proxyJson(resp.status, text) };
   try {
     const parsed = JSON.parse(text) as { text?: string };
-    return {
-      ok: true,
-      text: parsed.text || "",
-      meta: { sttMs, audioBytes: audio.size, model },
-    };
+    return { ok: true, text: parsed.text || "", sttMs };
   } catch {
     return { ok: false, error: json({ error: "Invalid STT response" }, 502) };
   }
